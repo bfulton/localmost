@@ -166,6 +166,7 @@ export const IPC_CHANNELS = {
   GITHUB_AUTH_CANCEL: 'github:auth-cancel',
   GITHUB_DEVICE_CODE: 'github:device-code',
   GITHUB_AUTH_STATUS: 'github:auth-status',
+  GITHUB_AUTH_RECONNECT: 'github:auth-reconnect',
   GITHUB_AUTH_LOGOUT: 'github:auth-logout',
   GITHUB_GET_REPOS: 'github:get-repos',
   GITHUB_GET_ORGS: 'github:get-orgs',
@@ -261,11 +262,6 @@ export type SleepProtection = 'never' | 'when-busy' | 'always';
 /** Log level - controls what gets displayed/saved. Lower = more verbose */
 export type LogLevel = 'debug' | 'info' | 'warn' | 'error';
 
-export type PreserveWorkDir = 'never' | 'session' | 'always';
-
-/** Tool cache location - controls where actions like setup-node cache downloaded tools */
-export type ToolCacheLocation = 'persistent' | 'per-sandbox';
-
 /** Log level priority for filtering (lower number = more verbose) */
 export const LOG_LEVEL_PRIORITY: Record<LogLevel, number> = {
   debug: 0,
@@ -284,10 +280,6 @@ export interface AppSettings {
   logLevel?: LogLevel;
   /** Minimum log level for runner output logs. Defaults to 'warn' */
   runnerLogLevel?: LogLevel;
-  /** Preserve workflow _work directory. Defaults to 'never' */
-  preserveWorkDir?: PreserveWorkDir;
-  /** Tool cache location. Defaults to 'persistent' (shared across restarts) */
-  toolCacheLocation?: ToolCacheLocation;
   /** Sandbox policy level for all sandbox restrictions. Defaults to 'strict' */
 }
 
@@ -350,13 +342,26 @@ export interface GitHubUserSearchResult {
   name: string | null;
 }
 
-/** A repository policy the runner has recorded, for review in the app. */
+/**
+ * A repository policy the runner has recorded, for review in the app. A
+ * repository with both an approved policy and a pending one appears twice.
+ */
 export interface PolicySummary {
   repository: string;
   approved: boolean;
   cachedAt: string;
-  /** Human-readable summary of what the policy grants */
+  /** Human-readable summary of what the policy grants, level first */
   grants: string[];
+  /**
+   * For a pending policy that would replace an approved one: what it changes,
+   * one line each, e.g. "~ level: strict -> permissive".
+   */
+  changes?: string[];
+  /**
+   * sha256 of exactly this policy. Approving quotes it back, and is refused if
+   * the pending policy is no longer the one shown.
+   */
+  stamp: string;
 }
 
 // =============================================================================
@@ -364,28 +369,32 @@ export interface PolicySummary {
 // =============================================================================
 
 /**
- * Sandbox policy level controls what restrictions are enforced during job execution.
- * This affects network access, filesystem access, and all other sandbox-exec restrictions.
+ * A policy's level: how much a job's proxy allows beyond the hosts the
+ * policy lists.
  *
  * - strict: Only access explicitly listed in .localmostrc is allowed. Most secure option.
- * - moderate: GitHub Actions infrastructure, common registries, and standard tool caches are allowed by default.
+ * - moderate: Also common package registries, and CDNs and GitHub content hosts anyone can publish to.
  * - permissive: All access is allowed. Use only for trusted repositories or debugging.
  */
 export type SandboxPolicyLevel = 'strict' | 'moderate' | 'permissive';
 
-/** Human-readable descriptions for sandbox policy level options */
+/**
+ * Human-readable descriptions of the policy levels: how much a job's proxy
+ * lets through before its .localmostrc adds hosts. A job runs in a macOS VM
+ * whose only way out is that proxy.
+ */
 export const SANDBOX_POLICY_LEVEL_DESCRIPTIONS: Record<SandboxPolicyLevel, { label: string; description: string }> = {
   strict: {
     label: 'Strict',
-    description: 'Only access explicitly listed in .localmostrc is allowed. Network connections, filesystem writes, and other operations must be pre-approved.',
+    description: 'Only GitHub Actions infrastructure and the hosts listed in .localmostrc are reachable.',
   },
   moderate: {
     label: 'Moderate',
-    description: 'GitHub Actions infrastructure, common package registries, and standard tool caches are allowed. This is the previous default behavior.',
+    description: 'Also common package registries, and CDNs and GitHub content hosts anyone can publish to.',
   },
   permissive: {
     label: 'Permissive',
-    description: 'All access is allowed with no restrictions. Use only for trusted repositories or when debugging policy issues.',
+    description: 'Every network host is reachable. Use only for trusted repositories or when debugging a policy.',
   },
 };
 
@@ -566,4 +575,10 @@ export interface ResourcePauseState {
   reason: string | null;
   /** All active conditions */
   conditions: ResourceCondition[];
+  /**
+   * The conditions a manual resume overrode, still holding, named by kind
+   * ("battery power", "the video call"); null when there are none. They do
+   * not pause the runner again until they clear and recur.
+   */
+  overridden?: string | null;
 }

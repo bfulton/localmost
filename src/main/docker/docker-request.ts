@@ -44,8 +44,17 @@ export interface DockerRequest {
   path: string;
   /** The vX.YY prefix if present. */
   apiVersion?: string;
-  /** First value per key, which is how the daemon reads a repeated key. */
+  /**
+   * The first value per key. A query that repeats a key is refused
+   * (targetError), save a list parameter (LIST_PARAMS), so every other key
+   * read here has one value.
+   */
   query: Record<string, string>;
+  /**
+   * Every value of each list parameter the path takes, in order: a build's
+   * tags. A list is judged on all its values, since the daemon uses them all.
+   */
+  queryLists: Record<string, string[]>;
   /** The parsed JSON body when the content type is JSON; undefined otherwise. */
   body?: unknown;
   /** Set when the content type promised JSON and the body did not parse. */
@@ -74,14 +83,78 @@ const headerValue = (headers: Record<string, string>, name: string): string | un
 const isJsonContentType = (contentType: string | undefined): boolean =>
   contentType !== undefined && contentType.split(';')[0].trim().toLowerCase() === 'application/json';
 
+/**
+ * The body's media type as the daemon's Go server takes it
+ * (mime.ParseMediaType): the Content-Type up to its parameters, trimmed and
+ * lowercased, or '' when there is none. Go keeps the type even when the
+ * parameters after it are malformed, so they are not looked at here either.
+ */
+export function mediaTypeOf(req: DockerRequest): string {
+  const value = headerValue(req.raw.headers, 'content-type');
+  return value === undefined ? '' : value.split(';')[0].trim().toLowerCase();
+}
+
+/**
+ * Query parameters a client sends once per value, by endpoint, and every
+ * daemon reads as the whole list: a build's tags (`docker build -t a -t b`,
+ * moby's r.Form["t"], Podman's []string field), so the evaluator judges
+ * every value (DockerRequest.queryLists). Only the exact spelling repeats;
+ * another casing of it is still refused, since moby would not read it at all.
+ */
+const LIST_PARAMS: Readonly<Record<string, ReadonlySet<string>>> = {
+  '/build': new Set(['t']),
+};
+
+/**
+ * Why a query string could be read as different parameters by another
+ * decoder, or undefined when it cannot.
+ *
+ * The filter forwards the query as it arrived, so the daemon decodes it
+ * again, and daemons disagree. moby reads the first value of a repeated key
+ * and answers 400 to a ";" or a bad escape; Podman's gorilla/schema keeps the
+ * last value, matches names case-insensitively, and reads past both. Judging
+ * `fromImage=postgres&fromImage=evil.example.com/x` as postgres would hand
+ * Podman a pull of the other, on the docker.io credential. So the forms on
+ * which they differ are refused rather than modelled: a key given more than
+ * once, in any casing or spelling of it, a ";", and a "%" that does not start
+ * a two-digit escape. None of them is something a client's encoder produces,
+ * save the lists in LIST_PARAMS.
+ */
+function ambiguousQuery(target: string, path: string, params: URLSearchParams): string | undefined {
+  const mark = target.indexOf('?');
+  const search = mark === -1 ? '' : target.slice(mark + 1);
+  if (search.includes(';')) return 'has a ";" in its query, which daemons split on differently';
+  if (/%(?![0-9A-Fa-f]{2})/.test(search)) return 'has a "%" in its query that does not start an escape';
+  const lists = LIST_PARAMS[path];
+  const seen = new Map<string, string>();
+  for (const key of params.keys()) {
+    const folded = key.toLowerCase();
+    const first = seen.get(folded);
+    if (first !== undefined && !(first === key && lists?.has(key))) {
+      return `names the query parameter "${key}" more than once, which daemons resolve differently`;
+    }
+    seen.set(folded, key);
+  }
+  return undefined;
+}
+
 export function parseDockerRequest(raw: DockerRequest['raw']): DockerRequest {
   // Only origin-form is accepted. Anything else either throws here (`//`,
   // `http://[`) or parses to a different path than the daemon will read, and
   // both are refusals rather than guesses.
   if (!raw.url.startsWith('/') || raw.url.startsWith('//')) {
     return {
-      method: raw.method, path: raw.url, query: {}, raw,
+      method: raw.method, path: raw.url, query: {}, queryLists: {}, raw,
       targetError: `request target "${raw.url}" is not a plain path; the localmost docker socket accepts origin-form targets only`,
+    };
+  }
+  // A request target has no fragment. The URL parser here would end the path
+  // at '#' and hide the rest, query included, while the daemon reads it as
+  // part of the target, so what was judged would not be what is forwarded.
+  if (raw.url.includes('#')) {
+    return {
+      method: raw.method, path: raw.url, query: {}, queryLists: {}, raw,
+      targetError: `request target "${raw.url}" carries a fragment; the localmost docker socket accepts origin-form targets only`,
     };
   }
 
@@ -92,7 +165,7 @@ export function parseDockerRequest(raw: DockerRequest['raw']): DockerRequest {
     url = new URL(raw.url, 'http://docker');
   } catch {
     return {
-      method: raw.method, path: raw.url, query: {}, raw,
+      method: raw.method, path: raw.url, query: {}, queryLists: {}, raw,
       targetError: `request target "${raw.url}" could not be parsed`,
     };
   }
@@ -105,12 +178,25 @@ export function parseDockerRequest(raw: DockerRequest['raw']): DockerRequest {
     path = versioned[2];
   }
 
+  const queryError = ambiguousQuery(raw.url, path, url.searchParams);
+  if (queryError) {
+    return {
+      method: raw.method, path, apiVersion, query: {}, queryLists: {}, raw,
+      targetError: `request target "${raw.url}" ${queryError}; the localmost docker socket accepts only a query every daemon reads one way`,
+    };
+  }
+
   const query: Record<string, string> = {};
   for (const key of url.searchParams.keys()) {
     if (!(key in query)) query[key] = url.searchParams.get(key)!;
   }
 
-  const req: DockerRequest = { method: raw.method, path, apiVersion, query, raw };
+  const queryLists: Record<string, string[]> = {};
+  for (const key of LIST_PARAMS[path] ?? []) {
+    if (url.searchParams.has(key)) queryLists[key] = url.searchParams.getAll(key);
+  }
+
+  const req: DockerRequest = { method: raw.method, path, apiVersion, query, queryLists, raw };
 
   if (isJsonContentType(headerValue(raw.headers, 'content-type')) && raw.body.length > 0) {
     try {

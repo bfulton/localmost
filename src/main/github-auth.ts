@@ -19,6 +19,97 @@ function isValidGitHubUrl(url: string): boolean {
 }
 
 /**
+ * One segment of a REST path, encoded.
+ *
+ * Owner, repo and the rest reach this file from the CLI socket, IPC and job
+ * payloads, and every request carries the user's token. Interpolated raw, a
+ * "/" or "?" in a name would steer that request to another endpoint; encoded,
+ * it stays one segment. A dot segment is refused outright, because the URL
+ * parser collapses "." and ".." before the request is sent, encoded or not.
+ */
+function segment(value: string | number): string {
+  const text = String(value);
+  if (text === '' || text === '.' || text === '..') {
+    throw new Error(`"${text}" is not a valid GitHub API path segment`);
+  }
+  return encodeURIComponent(text);
+}
+
+/** A value whose slashes are part of the path - a file path, a branch name - with each part encoded. */
+const segments = (value: string): string => value.split('/').map(segment).join('/');
+
+/**
+ * The name an author with no linked GitHub account goes by in an author set.
+ *
+ * Such an author is whoever wrote the email into a commit - anyone who can
+ * get one merged or pushed - so no allowlist may admit it. Logins are
+ * alphanumerics and hyphens, so a parenthesised name with spaces can never
+ * equal one, and since the admission refusal lists the authors it refused,
+ * the name itself says why. `detail` (a commit, an email, a name) comes from
+ * commit metadata, so control and format characters (a right-to-left
+ * override, a zero-width space) are replaced, lest the reason read as
+ * something else, and it is cut to 100 characters, not UTF-16 units, so the
+ * cut never splits one.
+ */
+export function unattributedAuthor(detail: string): string {
+  const shown = Array.from(detail.replace(/[\p{Cc}\p{Cf}]/gu, '?')).slice(0, 100).join('');
+  return `(unattributed ${shown}: no linked GitHub account, so no allowlist can admit it)`;
+}
+
+/** Commits per page when listing or comparing commits (GitHub's maximum). */
+const COMMIT_PAGE_SIZE = 100;
+
+/**
+ * The most commits an author check reads from one range or history. A longer
+ * one is refused rather than read in part.
+ */
+const COMMIT_READ_LIMIT = 1000;
+
+/** Entries per page of the repository activity API (GitHub's maximum). */
+const ACTIVITY_PAGE_SIZE = 100;
+
+/**
+ * The most pages of branch activity read for one window. A branch updated
+ * more often than that is refused rather than read in part.
+ */
+const ACTIVITY_PAGE_LIMIT = 10;
+
+/** One update of a branch, from the repository activity API. */
+export interface BranchUpdate {
+  /** The branch's commit before the update; all zeros when it was created. */
+  before: string;
+  /** The branch's commit after the update; all zeros when it was deleted. */
+  after: string;
+  /** GitHub's activity_type: push, force_push, pr_merge, branch_creation, ... */
+  type: string;
+}
+
+/** Whether `sha` is a full commit hash (SHA-1, or SHA-256 for such repositories), including all zeros. */
+function isCommitSha(sha: unknown): sha is string {
+  return typeof sha === 'string' && /^([0-9a-f]{40}|[0-9a-f]{64})$/.test(sha);
+}
+
+/** Whether `sha` is the all-zeros hash GitHub reports for a side of an update that has no commit. */
+export function isNullSha(sha: string): boolean {
+  return /^0+$/.test(sha);
+}
+
+/**
+ * The author a commit counts as: its linked account's login, lowercase.
+ *
+ * A commit with no linked account has an email that belongs to nobody GitHub
+ * knows, which is anyone who can get a commit merged or pushed. Skipping it
+ * read as "no new authors"; it stands in the set as unattributed, so no
+ * allowlist admits it and the refusal says which commit.
+ */
+function commitAuthor(commit: { sha?: string; author: { login?: string } | null }): string {
+  if (commit.author?.login) {
+    return commit.author.login.toLowerCase();
+  }
+  return unattributedAuthor(commit.sha ? `commit ${commit.sha.slice(0, 7)}` : 'commit');
+}
+
+/**
  * Rate limiting configuration for OAuth device flow polling.
  * These limits prevent abuse and ensure compliance with GitHub's API guidelines.
  */
@@ -314,25 +405,25 @@ export class GitHubAuth {
 
   async getRunnerRegistrationToken(accessToken: string, owner: string, repo: string): Promise<string> {
     const client = new GitHubClient(accessToken);
-    const data = await client.post<{ token: string }>(`/repos/${owner}/${repo}/actions/runners/registration-token`);
+    const data = await client.post<{ token: string }>(`/repos/${segment(owner)}/${segment(repo)}/actions/runners/registration-token`);
     return data.token;
   }
 
   async getOrgRunnerRegistrationToken(accessToken: string, org: string): Promise<string> {
     const client = new GitHubClient(accessToken);
-    const data = await client.post<{ token: string }>(`/orgs/${org}/actions/runners/registration-token`);
+    const data = await client.post<{ token: string }>(`/orgs/${segment(org)}/actions/runners/registration-token`);
     return data.token;
   }
 
   async getRunnerRemoveToken(accessToken: string, owner: string, repo: string): Promise<string> {
     const client = new GitHubClient(accessToken);
-    const data = await client.post<{ token: string }>(`/repos/${owner}/${repo}/actions/runners/remove-token`);
+    const data = await client.post<{ token: string }>(`/repos/${segment(owner)}/${segment(repo)}/actions/runners/remove-token`);
     return data.token;
   }
 
   async getOrgRunnerRemoveToken(accessToken: string, org: string): Promise<string> {
     const client = new GitHubClient(accessToken);
-    const data = await client.post<{ token: string }>(`/orgs/${org}/actions/runners/remove-token`);
+    const data = await client.post<{ token: string }>(`/orgs/${segment(org)}/actions/runners/remove-token`);
     return data.token;
   }
 
@@ -341,7 +432,7 @@ export class GitHubAuth {
    */
   async listRunners(accessToken: string, owner: string, repo: string): Promise<Array<{ id: number; name: string; status: string }>> {
     const client = new GitHubClient(accessToken);
-    const data = await client.get<{ runners: Array<{ id: number; name: string; status: string }> }>(`/repos/${owner}/${repo}/actions/runners`);
+    const data = await client.get<{ runners: Array<{ id: number; name: string; status: string }> }>(`/repos/${segment(owner)}/${segment(repo)}/actions/runners`);
     return data.runners || [];
   }
 
@@ -350,7 +441,7 @@ export class GitHubAuth {
    */
   async listOrgRunners(accessToken: string, org: string): Promise<Array<{ id: number; name: string; status: string }>> {
     const client = new GitHubClient(accessToken);
-    const data = await client.get<{ runners: Array<{ id: number; name: string; status: string }> }>(`/orgs/${org}/actions/runners`);
+    const data = await client.get<{ runners: Array<{ id: number; name: string; status: string }> }>(`/orgs/${segment(org)}/actions/runners`);
     return data.runners || [];
   }
 
@@ -359,7 +450,7 @@ export class GitHubAuth {
    */
   async deleteRunner(accessToken: string, owner: string, repo: string, runnerId: number): Promise<void> {
     const client = new GitHubClient(accessToken);
-    await client.delete(`/repos/${owner}/${repo}/actions/runners/${runnerId}`);
+    await client.delete(`/repos/${segment(owner)}/${segment(repo)}/actions/runners/${segment(runnerId)}`);
   }
 
   /**
@@ -367,7 +458,7 @@ export class GitHubAuth {
    */
   async deleteOrgRunner(accessToken: string, org: string, runnerId: number): Promise<void> {
     const client = new GitHubClient(accessToken);
-    await client.delete(`/orgs/${org}/actions/runners/${runnerId}`);
+    await client.delete(`/orgs/${segment(org)}/actions/runners/${segment(runnerId)}`);
   }
 
   /**
@@ -380,7 +471,7 @@ export class GitHubAuth {
     runId: number
   ): Promise<void> {
     const client = new GitHubClient(accessToken);
-    await client.post(`/repos/${owner}/${repo}/actions/runs/${runId}/cancel`, {});
+    await client.post(`/repos/${segment(owner)}/${segment(repo)}/actions/runs/${segment(runId)}/cancel`, {});
   }
 
   /**
@@ -394,7 +485,7 @@ export class GitHubAuth {
   ): Promise<string | null> {
     const client = new GitHubClient(accessToken);
     const data = await client.get<{ conclusion: string | null }>(
-      `/repos/${owner}/${repo}/actions/jobs/${jobId}`
+      `/repos/${segment(owner)}/${segment(repo)}/actions/jobs/${segment(jobId)}`
     );
     return data.conclusion;
   }
@@ -472,7 +563,7 @@ export class GitHubAuth {
             private: boolean;
             html_url: string;
           }>;
-        }>(`/user/installations/${installation.id}/repositories?per_page=100`);
+        }>(`/user/installations/${segment(installation.id)}/repositories?per_page=100`);
 
         if (data.repositories) {
           allRepos.push(...data.repositories);
@@ -500,14 +591,14 @@ export class GitHubAuth {
     const client = new GitHubClient(accessToken);
     try {
       // Try to update existing variable
-      await client.patch(`/repos/${owner}/${repo}/actions/variables/${name}`, {
+      await client.patch(`/repos/${segment(owner)}/${segment(repo)}/actions/variables/${segment(name)}`, {
         name,
         value,
       });
     } catch (error) {
       // If variable doesn't exist (404), create it
       if ((error as { status?: number }).status === 404) {
-        await client.post(`/repos/${owner}/${repo}/actions/variables`, {
+        await client.post(`/repos/${segment(owner)}/${segment(repo)}/actions/variables`, {
           name,
           value,
         });
@@ -531,7 +622,7 @@ export class GitHubAuth {
     const client = new GitHubClient(accessToken);
     try {
       // Try to update existing variable
-      await client.patch(`/orgs/${org}/actions/variables/${name}`, {
+      await client.patch(`/orgs/${segment(org)}/actions/variables/${segment(name)}`, {
         name,
         value,
         visibility,
@@ -539,7 +630,7 @@ export class GitHubAuth {
     } catch (error) {
       // If variable doesn't exist (404), create it
       if ((error as { status?: number }).status === 404) {
-        await client.post(`/orgs/${org}/actions/variables`, {
+        await client.post(`/orgs/${segment(org)}/actions/variables`, {
           name,
           value,
           visibility,
@@ -577,7 +668,7 @@ export class GitHubAuth {
     const usersWithNames = await Promise.all(
       (data.items || []).slice(0, 5).map(async (user) => {
         try {
-          const userDetails = await client.get<{ name: string | null }>(`/users/${user.login}`);
+          const userDetails = await client.get<{ name: string | null }>(`/users/${segment(user.login)}`);
           return {
             login: user.login,
             avatar_url: user.avatar_url,
@@ -610,10 +701,16 @@ export class GitHubAuth {
     let page = 1;
     const perPage = 100;
 
+    // anon=1, so authors with no linked account are listed too. anon=0 left
+    // them out - and GitHub links only the first 500 author emails, so past
+    // that it left out everyone - and the baseline read as trusted while code
+    // nobody vouched for was already on the default branch. Each one stands in
+    // the set as unattributed, which no allowlist admits: a repository with
+    // such an author anywhere in its history is refused under 'contributors'.
     while (true) {
-      const data = await client.get<Array<{ login: string }>>(
-        `/repos/${owner}/${repo}/contributors`,
-        { params: { per_page: String(perPage), page: String(page), anon: '0' } }
+      const data = await client.get<Array<{ login?: string; email?: string; name?: string }>>(
+        `/repos/${segment(owner)}/${segment(repo)}/contributors`,
+        { params: { per_page: String(perPage), page: String(page), anon: '1' } }
       );
 
       if (!data || data.length === 0) {
@@ -623,6 +720,8 @@ export class GitHubAuth {
       for (const contributor of data) {
         if (contributor.login) {
           contributors.push(contributor.login.toLowerCase());
+        } else {
+          contributors.push(unattributedAuthor(contributor.email || contributor.name || 'contributor'));
         }
       }
 
@@ -637,7 +736,9 @@ export class GitHubAuth {
 
   /**
    * Get commit authors between two SHAs.
-   * Returns array of author logins for commits from baseSha to headSha.
+   * Returns array of author logins for the commits in headSha that are not in
+   * baseSha - with three dots, those after their merge base, so it also holds
+   * when baseSha is not an ancestor of headSha, as after a force push.
    */
   async getCommitAuthors(
     accessToken: string,
@@ -647,33 +748,53 @@ export class GitHubAuth {
     headSha: string
   ): Promise<string[]> {
     const client = new GitHubClient(accessToken);
-    const authors = new Set<string>();
+    const authors = new Map<string, string>();
 
     try {
-      // Use compare API to get commits between two refs
-      const data = await client.get<{
-        total_commits: number;
-        commits: Array<{
-          author: { login: string } | null;
-          commit: { author: { name: string } | null };
-        }>;
-      }>(`/repos/${owner}/${repo}/compare/${baseSha}...${headSha}`);
+      // Called without paging parameters, compare returns at most 250
+      // commits while still reporting the true total; with them, it pages
+      // through all of them. The result gates job execution, so a range is
+      // read in full or not at all: past COMMIT_READ_LIMIT, or if the pages
+      // add up to less than the total, this throws.
+      let total = 0;
+      for (let page = 1; ; page++) {
+        const data = await client.get<{
+          total_commits: number;
+          commits: Array<{
+            sha: string;
+            author: { login: string } | null;
+          }>;
+        }>(`/repos/${segment(owner)}/${segment(repo)}/compare/${segment(baseSha)}...${segment(headSha)}`, {
+          params: { per_page: String(COMMIT_PAGE_SIZE), page: String(page) },
+        });
 
-      // The compare API caps the commits it returns (250) while still
-      // reporting the true total. A truncated response would silently omit
-      // authors, and callers gate job execution on this set.
-      const returned = data.commits?.length ?? 0;
-      if (typeof data.total_commits === 'number' && data.total_commits > returned) {
-        throw new Error(
-          `compare returned ${returned} of ${data.total_commits} commits; author list would be incomplete`
-        );
+        if (typeof data.total_commits !== 'number') {
+          throw new Error('compare response has no commit count');
+        }
+        total = data.total_commits;
+        if (total > COMMIT_READ_LIMIT) {
+          throw new Error(
+            `compare has ${total} commits, more than the ${COMMIT_READ_LIMIT} this check reads; author list would be incomplete`
+          );
+        }
+
+        const commits = data.commits || [];
+        for (const commit of commits) {
+          authors.set(commit.sha, commitAuthor(commit));
+        }
+        if (
+          authors.size >= total ||
+          commits.length < COMMIT_PAGE_SIZE ||
+          page * COMMIT_PAGE_SIZE >= COMMIT_READ_LIMIT
+        ) {
+          break;
+        }
       }
 
-      for (const commit of data.commits || []) {
-        // Prefer the GitHub user login if available
-        if (commit.author?.login) {
-          authors.add(commit.author.login.toLowerCase());
-        }
+      if (authors.size < total) {
+        throw new Error(
+          `compare returned ${authors.size} of ${total} commits; author list would be incomplete`
+        );
       }
     } catch (error) {
       // Do not swallow this. An empty result is indistinguishable from "no new
@@ -684,7 +805,138 @@ export class GitHubAuth {
       );
     }
 
+    return Array.from(new Set(authors.values()));
+  }
+
+  /**
+   * Authors of every commit reachable from `headSha`.
+   *
+   * For a branch created within the activity window, which has no earlier
+   * commit to compare from: in practice a new repository's first push. Like
+   * getCommitAuthors, a history longer than COMMIT_READ_LIMIT throws rather
+   * than being read in part, and so does any failure.
+   */
+  async getHistoryAuthors(
+    accessToken: string,
+    owner: string,
+    repo: string,
+    headSha: string
+  ): Promise<string[]> {
+    const client = new GitHubClient(accessToken);
+    const authors = new Set<string>();
+
+    try {
+      for (let page = 1; ; page++) {
+        if ((page - 1) * COMMIT_PAGE_SIZE >= COMMIT_READ_LIMIT) {
+          throw new Error(`history is longer than the ${COMMIT_READ_LIMIT} commits this check reads`);
+        }
+        const data = await client.get<Array<{ sha: string; author: { login?: string } | null }>>(
+          `/repos/${segment(owner)}/${segment(repo)}/commits`,
+          { params: { sha: headSha, per_page: String(COMMIT_PAGE_SIZE), page: String(page) } }
+        );
+
+        for (const commit of data || []) {
+          authors.add(commitAuthor(commit));
+        }
+        if (!data || data.length < COMMIT_PAGE_SIZE) {
+          break;
+        }
+      }
+    } catch (error) {
+      throw new Error(
+        `Failed to list the commits of ${headSha} for ${owner}/${repo}: ${(error as Error).message}`
+      );
+    }
+
     return Array.from(authors);
+  }
+
+  /**
+   * Every update of `branch` GitHub recorded within `windowMs` before now -
+   * pushes, force pushes, pull request and merge queue merges, creation and
+   * deletion - from the repository activity API, newest first.
+   *
+   * The window is measured on GitHub's clocks: each entry's timestamp is when
+   * GitHub recorded the update, and "now" is the Date header of the first
+   * page, so neither a committer's dates nor this machine's clock moves it.
+   * The result gates job execution, so anything that would leave the window
+   * read in part throws: an API error, an entry for another ref, entries out
+   * of order, a missing Date header, or more than ACTIVITY_PAGE_LIMIT pages.
+   */
+  async getRecentBranchUpdates(
+    accessToken: string,
+    owner: string,
+    repo: string,
+    branch: string,
+    windowMs: number
+  ): Promise<BranchUpdate[]> {
+    const client = new GitHubClient(accessToken);
+    const endpoint = `/repos/${segment(owner)}/${segment(repo)}/activity`;
+    const ref = `refs/heads/${branch}`;
+    const updates: BranchUpdate[] = [];
+
+    try {
+      let params: Record<string, string> = {
+        ref,
+        direction: 'desc',
+        per_page: String(ACTIVITY_PAGE_SIZE),
+      };
+      let cutoff: number | undefined;
+      let previous = Infinity;
+
+      for (let page = 1; ; page++) {
+        if (page > ACTIVITY_PAGE_LIMIT) {
+          throw new Error(
+            `more than ${ACTIVITY_PAGE_LIMIT * ACTIVITY_PAGE_SIZE} updates of ${branch} within the window`
+          );
+        }
+        const { data, next, date } = await client.getPage<Array<{
+          before: string;
+          after: string;
+          ref: string;
+          timestamp: string;
+          activity_type: string;
+        }>>(endpoint, params);
+
+        if (cutoff === undefined) {
+          if (!date) {
+            throw new Error('activity response has no Date header');
+          }
+          cutoff = date.getTime() - windowMs;
+        }
+
+        let reachedCutoff = false;
+        for (const entry of data || []) {
+          if (entry.ref !== ref && entry.ref !== branch) {
+            throw new Error(`activity entry for ${entry.ref}, not ${ref}`);
+          }
+          const at = Date.parse(entry.timestamp);
+          if (Number.isNaN(at) || at > previous) {
+            throw new Error(`activity entry timestamp '${entry.timestamp}' is out of order`);
+          }
+          previous = at;
+          if (at < cutoff) {
+            reachedCutoff = true;
+            break;
+          }
+          if (!isCommitSha(entry.before) || !isCommitSha(entry.after)) {
+            throw new Error(`activity entry has no commit range: ${entry.before}...${entry.after}`);
+          }
+          updates.push({ before: entry.before, after: entry.after, type: entry.activity_type });
+        }
+
+        if (reachedCutoff || !next) {
+          break;
+        }
+        params = next;
+      }
+    } catch (error) {
+      throw new Error(
+        `Failed to list recent updates of ${branch} for ${owner}/${repo}: ${(error as Error).message}`
+      );
+    }
+
+    return updates;
   }
 
   /**
@@ -705,7 +957,7 @@ export class GitHubAuth {
 
     try {
       const data = await client.get<{ content?: string; encoding?: string }>(
-        `/repos/${owner}/${repo}/contents/${filePath}`,
+        `/repos/${segment(owner)}/${segment(repo)}/contents/${segments(filePath)}`,
         { params: { ref } }
       );
 
@@ -737,12 +989,12 @@ export class GitHubAuth {
 
     // Get repo info to find default branch name
     const repoData = await client.get<{ default_branch: string }>(
-      `/repos/${owner}/${repo}`
+      `/repos/${segment(owner)}/${segment(repo)}`
     );
 
     // Get the branch to find HEAD SHA
     const branchData = await client.get<{ commit: { sha: string } }>(
-      `/repos/${owner}/${repo}/branches/${repoData.default_branch}`
+      `/repos/${segment(owner)}/${segment(repo)}/branches/${segments(repoData.default_branch)}`
     );
 
     return {

@@ -87,6 +87,31 @@ describe('SetupWizard', () => {
         expect(screen.getByText('Configure Runner')).toBeInTheDocument();
       });
     });
+
+    it('should stay on sign in, and sign in again from it, when the saved session has expired', async () => {
+      // The status still reports the session as authenticated, so Settings
+      // keeps showing who it belongs to, but no token can be had from it:
+      // skipping ahead would reach an empty repository list with no way back.
+      mockLocalmost.github.getAuthStatus.mockResolvedValue({
+        isAuthenticated: true,
+        expired: true,
+        user: { login: 'testuser', name: 'Test', avatar_url: '' },
+      });
+      mockLocalmost.runner.isDownloaded.mockResolvedValue(true);
+
+      render(<SetupWizard {...defaultProps} />);
+
+      expect(await screen.findByText(/session has expired/i)).toBeInTheDocument();
+      expect(screen.queryByText('Configure Runner')).not.toBeInTheDocument();
+      expect(mockLocalmost.github.getRepos).not.toHaveBeenCalled();
+
+      fireEvent.click(screen.getByRole('button', { name: 'Sign in with GitHub' }));
+
+      await waitFor(() => {
+        expect(mockLocalmost.github.startDeviceFlow).toHaveBeenCalled();
+        expect(screen.getByText('Configure Runner')).toBeInTheDocument();
+      });
+    });
   });
 
   describe('Auth Step - Device Flow', () => {

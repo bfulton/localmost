@@ -13,15 +13,13 @@ import {
   getPowerSaveBlockerId,
   getBrokerProxyService,
   getEffectivePauseState,
-  setUserPaused,
-  setResourcePaused,
   getLogger,
-  getHeartbeatManager,
-  getIsQuitting,
+  getResourceMonitor,
 } from './app-state';
-import { IPC_CHANNELS } from '../shared/types';
 import { findAsset } from './log-file';
+import { isRunning as isRunnerStarted, isStarting as isRunnerStarting } from './runner-state-service';
 import { confirmQuitIfBusy } from './window';
+import { pauseRunner, resumeRunner } from './runner-pause';
 
 /**
  * Initialize the system tray using TrayManager.
@@ -59,49 +57,15 @@ export const initTray = (): void => {
         updateTrayMenu();
       },
       onPause: async () => {
-        getLogger()?.info('User paused runner');
-        setUserPaused(true);
-
-        // Stop heartbeat timer first, then clear variables
-        const heartbeatManager = getHeartbeatManager();
-        heartbeatManager?.stop();
-        await heartbeatManager?.clear();
-
-        // Notify renderer of pause state change
-        const mainWindow = getMainWindow();
-        if (mainWindow && !mainWindow.isDestroyed() && !getIsQuitting()) {
-          mainWindow.webContents.send(IPC_CHANNELS.RESOURCE_STATE_CHANGED, {
-            isPaused: true,
-            reason: 'Paused by user',
-            conditions: [],
-          });
-        }
-
+        await pauseRunner();
         updateTrayMenu();
       },
       onResume: async () => {
-        getLogger()?.info('User resumed runner');
-        // Clear both user and resource pause - user override takes precedence
-        setUserPaused(false);
-        setResourcePaused(false);
-
-        // Restart heartbeat to signal availability
-        const heartbeatManager = getHeartbeatManager();
-        const authState = getAuthState();
-        if (heartbeatManager && authState?.accessToken) {
-          await heartbeatManager.start();
+        try {
+          await resumeRunner();
+        } catch (err) {
+          getLogger()?.error(`Failed to resume runner: ${(err as Error).message}`);
         }
-
-        // Notify renderer of pause state change
-        const mainWindow = getMainWindow();
-        if (mainWindow && !mainWindow.isDestroyed() && !getIsQuitting()) {
-          mainWindow.webContents.send(IPC_CHANNELS.RESOURCE_STATE_CHANGED, {
-            isPaused: false,
-            reason: null,
-            conditions: [],
-          });
-        }
-
         updateTrayMenu();
       },
       onQuit: async () => {
@@ -146,13 +110,19 @@ export const updateTrayMenu = (): void => {
   }
 
   const status: TrayStatusInfo = {
-    isAuthenticated: !!authState,
+    // An expired session keeps its auth state, login and all, so Settings can
+    // offer to reconnect as the right person. It cannot get a token, so it is
+    // not connected, and like a signed-out one it gets no Pause or Resume.
+    isAuthenticated: !!authState && !authState.expired,
+    isSessionExpired: !!authState?.expired,
     isConfigured: runnerManager?.isConfigured() ?? false,
     runnerStatus: effectiveStatus,
     isBusy: runnerStatus?.status === 'busy',
     isSleepBlocked: powerSaveBlockerId !== null,
     isPaused: pauseState.isPaused,
     pauseReason: pauseState.reason,
+    isRunnerStarted: isRunnerStarted() || isRunnerStarting(),
+    pauseOverridden: getResourceMonitor()?.getPauseState().overridden ?? null,
     isWindowVisible: mainWindow?.isVisible() ?? false,
   };
   trayManager?.updateMenu(status);

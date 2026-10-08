@@ -1,0 +1,1877 @@
+# VM Docker Backend — Interface Contract
+
+The interfaces between the pieces of the [VM Docker backend](vm-docker-backend.md).
+Four groups can build against this at the same time: the guest image, the Swift
+helper, the Electron integration, and the puller and cache. Each group tests
+against fakes of the others that behave as described here.
+
+**Contract version 1.** A change to anything in this file goes in the same PR
+as this file's update, and the version stamps below (`"v":1`, `schema`,
+`agentProtocol`) move with it. Where a value is marked *verified*, the design
+spike on 2026-09-30 ran it. Everything else is specified here, not yet tested.
+
+Until the backend first ships, version 1 is still being written: what the
+work packages settle while building it (the helper's event and command keys,
+`E_PROTO`, `synced` on every `stopped`, `stopped` before `listening`, and the
+rest recorded below) is part of version 1, and the stamps stay at 1. Every
+change after the first release moves them. HelperClient, the fake helper
+(§8) and the helper all follow the text as it stands here.
+
+## 1. Identifiers and host paths
+
+| Name | Form | Made by | Meaning |
+|---|---|---|---|
+| `slot` | integer 1–99 | runner-manager | The worker's instance number. |
+| `sandboxId` | `^(?:0\|[1-9][0-9]?)-[0-9a-f]{12}$` | `buildSandbox` (already this shape) | The basename of the worker's sandbox directory. The slot has no leading zero, as nothing writes one. |
+| `vmId` | `^(?:0\|[1-9][0-9]?)-[0-9a-f]{12}$` | `VmManager` (`<slot>-<randomBytes(6) hex>`) | One VM. It is never reused. A refresh VM has no worker and uses slot `0` (`0-<12 hex>`). No leading zero, so nothing but `0-` reads as the refresh slot. |
+| digest | `^sha256:[0-9a-f]{64}$` | a registry, or the VM | Every digest from outside Electron is checked against this before any use (§6.3). |
+| `repoKey` | `^[0-9a-f]{16}$` | `repoKeyOf(repository)`: first 16 hex of `sha256(lowercase("owner/name"))` | Per-repository store and cache. |
+| `<data>` | absolute | `getAppDataDir()` | Normally `~/.localmost`. Its real path must lie under `/Users`, `/Volumes` or `/private`, the guest's share mount roots (§3.4 step 3); for any other, `VmManager` refuses the VM before the helper runs, with a message that names the path. The e2e launcher's `LOCALMOST_CONFIG_DIR` under `os.tmpdir()` resolves under `/private/var/folders`, which is covered. |
+| `<resources>` | absolute | `process.resourcesPath`, or the checkout's `build/` in development | Where the guest is found (`<resources>/guest`). Electron's app path is the checkout under `electron .` but `build/dist` under `electron build/dist/main.js` (the e2e launch); `getVmResourcesDir()` gives the same `build/` for both. |
+| `<helper>` | absolute | `helperPath()` in `vm/paths.ts` | `<resources>/localmost-vm` when packaged; `build/localmost-vm` in development (`build:helper` copies it there). The one path used by the spawn, the helper profile and the sweep. |
+| `<docker-cli>` | absolute | `dockerCliPath()` in `vm/paths.ts` | `<resources>/docker-cli/docker`; `build/docker-cli/docker` in development. |
+
+```
+<data>/runner/sandbox/<sandboxId>/            made by buildSandbox (existing)
+<data>/runner/sandbox/<sandboxId>/_work/      THE SHARE: made by buildSandbox, before any process runs there
+<data>/runner/sandbox/<sandboxId>/_work/.localmost-share   32 hex nonce, written O_CREAT|O_EXCL before the worker starts
+<data>/runner/sandbox/<sandboxId>/docker.sock the filter socket (existing)
+<data>/runner/sandbox/<sandboxId>/.docker/     empty DOCKER_CONFIG for the job's CLI, made by buildSandbox (not shared)
+<data>/vm/                                    mode 0700; `tmutil addexclusion` when created
+<data>/vm/jobs/<vmId>/                        mode 0700, made by VmManager
+    helper.sb  data.img  helper.pid  console.log  docker.sock  agent.sock
+    blobs/sha256/<64 hex>                     images that needed credentials: this job only, deleted with the VM
+<data>/vm/images/<repoKey>/blobs/sha256/<64 hex>
+<data>/vm/images/<repoKey>/refs.json
+<data>/vm/cache/<repoKey>/data.img            golden data disk
+<data>/vm/cache/<repoKey>/data.img.new        a refresh in progress (swept at startup)
+<data>/vm/cache/<repoKey>/meta.json
+```
+
+The longest socket path, `<data>/vm/jobs/<vmId>/docker.sock`, is `<data>` plus 36
+bytes, well under the 103-byte limit for any `<data>` the sandbox already
+accepts. Every path above is inside `<data>`,
+which every job profile denies for reads and writes (VZ-RISKS R9).
+
+## 2. The helper: `localmost-vm`
+
+A Swift command-line program built for `arm64-apple-macos14`. It lives at
+`<helper>` (§1) and runs exactly one VM per process.
+
+### 2.1 Invocation
+
+Electron main spawns `<helper>` through `/usr/bin/sandbox-exec -f <data>/vm/jobs/<vmId>/helper.sb`
+with an empty environment, except `PATH=/usr/bin:/bin` and `TMPDIR=<data>/vm/jobs/<vmId>`,
+in the working directory `<data>/vm/jobs/<vmId>`.
+`HelperClient` takes the spawn function as an injected dependency; unit tests
+pass one that runs the fake helper (§8) directly, without `sandbox-exec`. The
+real `sandbox-exec` wrapping is tested only in `helper-client.sandbox.test.ts`,
+which follows the repo's three-mode pattern.
+
+```
+localmost-vm run
+  --vm-id <vmId>
+  --mode job|refresh
+  --data-dir <abs path>          # <data>; the helper resolves it once, from <data>/vm/jobs/<vmId> (below)
+  --resources <abs path>         # <resources>; the helper reads guest/ from here
+  --sandbox-id <sandboxId>       # job mode only
+  --repo-key <repoKey>           # refresh mode only
+  --proxy-port <1..65535>        # job mode only: the worker's ProxyServer port on 127.0.0.1
+  --cpus <1..64>
+  --memory-mib <1024..65536>
+  --rosetta auto|off
+localmost-vm version             # prints {"helper":"<semver>","contract":1} and exits 0
+```
+
+The helper derives every path it uses from these arguments. Nothing on its
+command line is a path the job chose.
+
+- `<data>` is resolved once, from the VM's own directory: the helper opens
+  `<data>/vm/jobs/<vmId>` with `O_DIRECTORY|O_NOFOLLOW`, reads its real path
+  with `F_GETPATH`, and requires it to end in `/vm/jobs/<vmId>`; what is
+  before that is the real `<data>`. Otherwise: `E_ARGS`. It never walks
+  `<data>`'s parents with `realpath(3)`: under the §2.5 profile that fails,
+  because the profile grants no metadata reads above the paths below.
+- Share (job mode): `S = <real data>/runner/sandbox/<sandboxId>/_work`.
+  The helper opens `S` with `O_DIRECTORY|O_NOFOLLOW` (so it is a directory
+  and not a link), and requires that its real path (`F_GETPATH`) is exactly
+  `S` (so no link at the sandbox, at `runner/sandbox`, or anywhere below
+  `<data>` moved it), that it is on the same filesystem as `<data>/vm/jobs/<vmId>`
+  (`st_dev` and `f_fsid` equal), and that it is not itself a mount point
+  (`f_mntonname != S`). The last two refuse a DMG, FUSE or SMB mount placed
+  over `_work`, over the sandbox, or over any directory between them and
+  `<data>`, which seatbelt's path rules do not see. Every check is made on
+  descriptors of paths the §2.5 profile grants, so it needs no rule of its
+  own. The helper runs the checks before it builds the VM and again right
+  before `start`, and the second time also requires the same directory as
+  the first (`st_dev`, `st_ino` and `f_fsid` equal), not merely one at the
+  same path. Electron runs the §2.1 checks before the spawn. If any check
+  fails: `E_SHARE`. *Verified (WP-B):* a DMG mounted over `_work` gives
+  `E_SHARE` before `start` under the profile.
+- These checks hold at the moment each is made, and only for `_work` and
+  the directories above it. A mount placed between the last check and VZ
+  resolving the path, or anywhere below `_work`, is still inside the
+  `(subpath "<S>")` grant, which goes by path. What stops a job from making
+  such a mount is the job profile (§5.5): it is deny-default and never
+  allows `file-mount`, and it must never be given it. The helper's checks
+  are a point-in-time backstop for that. *Verified:* seatbelt's write rules
+  do not stop a DiskArbitration mount: under `(allow default)` with
+  `(deny file-write* (subpath T))`, `hdiutil attach -mountpoint` mounted a
+  DMG on `T/_work` and on `T/_work/sub`; with `(deny file-mount)` both
+  failed with "Permission denied".
+- Data disk: `<data>/vm/jobs/<vmId>/data.img` in job mode, or
+  `<data>/vm/cache/<repoKey>/data.img.new` in refresh mode. Electron prepares it
+  (clone or new sparse file) before the spawn. If it is missing: `E_DISK`.
+- Guest: `<resources>/guest/{vmlinux,initramfs.cpio.gz,rootfs.erofs}`. The
+  helper checks each file's size against `manifest.json` (`schema` 1,
+  `artifacts.<name>.size`; the manifest is read with `O_NOFOLLOW` and capped
+  at 1 MiB), and that each is a regular file, not a link (Electron checks the
+  hashes, §5.4). On a mismatch: `E_GUEST_IMAGE`.
+- `helper.pid`: the helper writes its pid and a newline to
+  `<data>/vm/jobs/<vmId>/helper.pid` (mode 0600, `O_NOFOLLOW`) as soon as the
+  VM directory has been checked, before any other check, so that the
+  startup sweep finds a helper that got that far.
+
+### 2.2 The VM it builds
+
+| VZ setting | Value |
+|---|---|
+| Boot loader | `VZLinuxBootLoader(kernelURL: vmlinux)`, `initialRamdiskURL: initramfs.cpio.gz` |
+| Command line | `console=hvc0 rdinit=/init ro quiet panic=-1 ipv6.disable=1 lm.mode=<mode>` |
+| CPUs, memory | `--cpus`, `--memory-mib` |
+| Serial | virtio console to `<data>/vm/jobs/<vmId>/console.log`, truncated to its last 1 MiB when it exceeds 2 MiB |
+| Storage | `vda`: `rootfs.erofs`, `readOnly: true`, sync `.full`. `vdb`: data disk, `readOnly: false`, cache `.automatic`, sync `.none` (job) or `.fsync` (refresh) |
+| Directory sharing | job mode: exactly one `VZVirtioFileSystemDeviceConfiguration(tag: "work")`, `VZSingleDirectoryShare(VZSharedDirectory(url: S, readOnly: false))`. Plus, when `--rosetta auto` and `VZLinuxRosettaDirectoryShare.availability == .installed`, tag `"rosetta"`. Refresh mode: no shares. |
+| Network | **none**. `networkDevices` is empty. |
+| Socket | one `VZVirtioSocketDeviceConfiguration` |
+| Entropy | `VZVirtioEntropyDeviceConfiguration` |
+| Balloon, graphics, audio, USB, keyboard, pointing | none |
+
+### 2.3 Sockets and vsock
+
+| Endpoint | Created by | On connect |
+|---|---|---|
+| `<data>/vm/jobs/<vmId>/docker.sock` (unix, 0600) | helper, before `start` | `socketDevice.connect(toPort: 2375)`, then copy bytes both ways until either side closes. If the dial fails, close the unix connection at once. |
+| `<data>/vm/jobs/<vmId>/agent.sock` (unix, 0600) | helper, before `start` | The same, to guest port **1025**. |
+| vsock **3128**, host side (`setSocketListener(forPort: 3128)`) | helper, after `start`, job mode only | Connect TCP `127.0.0.1:<proxy-port>`, then copy bytes both ways. If the connect fails, close the vsock connection. |
+
+These three are all there is. The helper listens on no other vsock port and
+dials no other address. It never parses the bytes it copies. Limits: 64
+concurrent connections per unix socket, 256 relay connections, and a 1 MiB
+buffer per direction. A connection past a limit is closed at once. The
+helper raises its own soft `RLIMIT_NOFILE` to 1024 (within the hard limit)
+at start, since those limits need about 770 descriptors and launchd's
+default is 256.
+
+The unix sockets exist from `listening`, but until `started` there is no VM
+to dial, and a connection made then is closed at once. Electron connects to
+`docker.sock` and `agent.sock` only after `started`. The relay's connect to
+the proxy is non-blocking and gives up after 5 s, closing the guest's
+connection.
+
+Verified: a host vsock listener, a host dial to a guest port, and a static Go
+guest agent on both ends.
+
+### 2.4 Control protocol (stdio)
+
+Framing: UTF-8 JSON, one object per line (`\n`), 64 KiB at most per line. Each
+object carries `"v":1`. Commands arrive on stdin and events leave on stdout.
+stderr carries free-form log lines of the form `<level> <message>`, where level
+is one of `debug`, `info`, `warn`, `error`. Electron logs them under the VM id.
+A line on stdout that is not a valid event makes Electron kill the helper.
+
+On the wire, an event names itself in `event` and a command in `op`, as the
+agent protocol names its ops (§3.4); an answer has neither:
+
+```
+{"v":1,"event":"listening","dockerSocket":"<data>/vm/jobs/<vmId>/docker.sock","agentSocket":"<data>/vm/jobs/<vmId>/agent.sock"}
+{"v":1,"event":"started","pid":4242,"rosetta":"installed","startMs":310}
+{"v":1,"id":1,"op":"stop","graceMs":0}          (stdin)
+{"v":1,"id":1,"ok":true}
+{"v":1,"event":"stopped","reason":"requested","synced":false}
+```
+
+`listening` must name exactly the two sockets of §1 for its VM id, and events
+come in the order `listening`, `started`, `stopped`, each once; Electron kills
+a helper that sends anything else. A `code` is upper-case letters, digits and
+underscores, at most 32 characters.
+
+**Events (helper → Electron)**
+
+| Event | When | Fields |
+|---|---|---|
+| `listening` | Both unix sockets bound, before `start` | `dockerSocket`, `agentSocket` |
+| `started` | `VZVirtualMachine.start` succeeded | `pid` (the helper's own pid; the VZ XPC process is not observable), `rosetta`: `installed`, `notInstalled`, `notSupported` or `off`, and `startMs` (milliseconds since exec). `off` whenever the Rosetta share was not asked for: `--rosetta off`, and every refresh VM, which has no shares. |
+| `stopped` | The helper is ending. It exits right after, with the code of the table below. It is always the last line on stdout, including for a failure before `listening` (bad arguments, a guest of the wrong size, a refused share), so that Electron reads why from it. | `reason`: `guest` (guest powered off), `requested` or `error`; `code`, `message` when `error` (the message at most 2 KiB); `synced`, a boolean on every `stopped`: true only once `F_FULLFSYNC` of the data disk succeeded after a `guest` stop in refresh mode |
+
+The order is `listening`, `started`, `stopped`; a failure ends it early with
+`stopped`. A stop requested before `started` is carried out, with no grace,
+once the VM has started. If start has still not finished 15 s after that
+stop, the helper emits `stopped` (reason `requested`) and exits, and VZ
+tears the VM down with it.
+
+**Commands (Electron → helper)** are named by an `op` field, as the agent's
+requests are, for example `{"v":1,"id":7,"op":"stop","graceMs":0}`. Each has
+an integer `id` and is answered with `{"v":1,"id":<id>,"ok":true}` or with
+`{"v":1,"id":<id>,"ok":false,"code":"…","message":"…"}`. The answer to
+`stop` comes as soon as the stop is under way, before `stopped`. A command
+the helper cannot carry out (an unknown `op`, a `v` other than 1, a
+`graceMs` out of range) is answered with code `E_PROTO` and changes nothing.
+A line that is not a JSON object with an integer `id`, or is over 64 KiB, is
+logged on stderr and dropped, since there is no id to answer.
+
+| Command | Fields | Effect |
+|---|---|---|
+| `stop` | `graceMs` (0–60000) | If `graceMs > 0`: `requestStop()`, then wait for the guest to stop, up to `graceMs`. Then `stop()`, which forces it. `stopped` follows, with reason `requested` even when the guest powered off in the grace. A later `stop` with `graceMs: 0` cuts the grace short. |
+| `ping` | – | Answers with `"state": "starting"`, `"running"` or `"stopping"`. |
+
+**Signals.** SIGTERM or SIGINT is `stop` with `graceMs: 0`, then exit. SIGKILL
+leaves the VM to VZ, which stops it within about 2 s (R27, verified).
+
+**Parent death.** At start the helper records `getppid()` and watches it with
+kqueue `EVFILT_PROC`/`NOTE_EXIT`. If that process exits, or stdin reaches EOF,
+the helper acts as on `stop` with `graceMs: 0`, then exits. If `getppid()` is
+already 1 at start, it exits with `E_ARGS`. This is what makes a crash or
+SIGKILL of Electron main stop every VM. *Verified (WP-B, under the §2.5
+profile):* SIGKILL of the helper, SIGKILL of its parent (with stdin still
+open, so kqueue alone saw it), and closing its stdin each left no helper and
+no VZ XPC process within 60 ms.
+
+**Exit codes and error codes**
+
+| Exit | `code` | Meaning |
+|---|---|---|
+| 0 | – | Stopped cleanly (`guest` or `requested`) |
+| 64 | `E_ARGS` | Bad or missing argument |
+| 65 | `E_SHARE` | The share failed a §2.1 check |
+| 66 | `E_GUEST_IMAGE` | A guest artifact is missing or the wrong size |
+| 67 | `E_DISK` | The data disk is missing or cannot be attached |
+| 68 | `E_VZ_CONFIG` | `validate()` failed |
+| 69 | `E_VZ_START` | `start` failed. This includes EPERM from the helper's own sandbox. |
+| 70 | `E_SOCKET` | A unix socket could not be bound |
+| 71 | `E_GUEST_ERROR` | `didStopWithError` |
+| 72 | `E_SYNC` | `F_FULLFSYNC` failed after a refresh |
+
+Electron's `HelperClient` names three more for a helper that did not exit by
+this table: `E_HELPER_PROTOCOL` (it broke this protocol and was killed),
+`E_HELPER_EXIT` (another exit code, or it could not be spawned) and
+`E_HELPER_KILLED` (a signal). `stop` from Electron sends the command with its
+grace, SIGTERM once the grace has passed, and SIGKILL 5 s after that.
+
+### 2.5 The helper's seatbelt profile
+
+Electron writes `helper.sb` for each VM from `buildHelperProfile(opts)` in
+`src/main/vm/helper-profile.ts`. Every interpolated path is a real path and is
+escaped as the job profile escapes its paths.
+
+```scheme
+(version 1)
+(deny default)
+(import "system.sb")
+(allow process-exec (literal "<helper>"))
+(allow file-read*
+  (literal "<helper>")
+  (subpath "<resources>/guest"))
+(allow file-read* file-write* (subpath "<data>/vm/jobs/<vmId>"))
+;; job mode:
+(allow file-read* file-write* (subpath "<S>"))
+;; The second layer of the share rule. VZ's service reaches the share only
+;; through an extension the helper issues for the path it resolved at start.
+;; Scoped to <S> and never broadened: a link planted at <S> resolves outside
+;; it, so no extension is issued and start fails with EPERM.
+(allow file-issue-extension
+  (require-all
+    (extension-class "com.apple.app-sandbox.read-write" "com.apple.app-sandbox.read")
+    (subpath "<S>")))
+(allow generic-issue-extension (extension-class "com.apple.virtualization.extension.fuse"))
+(allow network-outbound (remote ip "localhost:<proxy-port>"))
+;; refresh mode, instead of the job-mode rules above: its one disk, and no
+;; share, so no extension rule at all.
+(allow file-read* file-write* (literal "<data>/vm/cache/<repoKey>/data.img.new"))
+;; both modes: the helper's own unix sockets
+(allow network-bind network-inbound (subpath "<data>/vm/jobs/<vmId>"))
+```
+
+A refresh VM's helper directory is `<data>/vm/jobs/0-<12 hex>`, so its
+sockets, console and pid file are covered by the jobs rule. Electron, not the
+helper, writes `meta.json` and renames `data.img.new`.
+
+*Verified (spike):* a VZ host under a deny-default profile with the job-mode
+rules above, including the scoped `file-issue-extension` rule, boots a guest
+and the guest reads the share. A share outside the `(subpath "<S>")` grant, or
+a granted path that is a link to somewhere outside it, fails `start` with
+EPERM. *Verified (review probe):* the same profile *without* the
+`file-issue-extension` rule starts the VM and vsock works, but every read of
+the share in the guest fails with "Operation not permitted". So that rule is
+what the EPERM rests on, and a profile without it gives a VM whose share does
+not work. A read-write data disk in a granted directory attached without any
+extension rule.
+
+*Verified (WP-B, the real helper under exactly these rules, macOS 26.6.2,
+M2):* job and refresh VMs boot; the erofs root attaches read-only as `vda`
+and the data disk as `vdb`; `agent.sock` reaches the guest's port 1025 and
+`docker.sock` answers `/_ping`; a file in the granted `_work` is readable in
+the guest, and without the `file-issue-extension` rule it is not ("Operation
+not permitted"; the VM still starts, as it does when that rule names another
+directory). The helper, not VZ, is the first to refuse a link at `_work` or
+an ungranted share: its own open of `S` fails, with `E_SHARE`, before
+`start`. When `_work` is swapped for a link to an ungranted directory right
+after `listening`, past the helper's last check, `start` fails with EPERM
+(`E_VZ_START`, "a directory sharing device configuration is invalid" over
+`NSPOSIXErrorDomain 1`) in 11 of 12 runs. In the twelfth, `start` was not
+refused: the VM started, `started` was emitted, and the share mounted in
+the guest, but every read of it failed with EPERM, so nothing outside was
+read. That run fails closed only because of the nonce check (the agent's
+`configure` answer, §3.4, against the nonce Electron wrote; design S1(g)):
+Electron must treat that check as mandatory, and never read `started` as
+proof that the share is the right directory. The relay reaches
+`127.0.0.1:<proxy-port>`; a helper told to dial another port is refused by
+seatbelt (EPERM) and closes the guest's connection. The same holds with the
+helper signed by an Apple Development identity with the hardened runtime.
+Rosetta needs no rule of its own: under exactly these rules the Rosetta
+share mounts, binfmt registers, and an x86-64 static binary runs in the
+guest. `sandbox-exec` tracing shows one denial when Rosetta is shared,
+`generic-issue-extension com.apple.virtualization.extension.rosetta-directory-share`;
+Rosetta works with it denied, so it is benign and not granted. The only
+other denials are Foundation's reads of `~/.CFUserTextEncoding`, the
+helper's own directory and the global preferences, and a `mach-task-name`
+lookup of the VZ XPC process; none is needed, and none is granted. A hijacked
+stream's half-close crosses the relay: `printf 'hi\n' | docker run -i --rm`
+of a one-binary `cat` image, through `docker.sock`, prints `hi` and returns;
+with the relay's `shutdown(SHUT_WR)` removed it never returns.
+
+## 3. The guest
+
+### 3.1 vsock ports
+
+| Port | Direction | Listener | Purpose |
+|---|---|---|---|
+| 1025 | host → guest | `lm-agent` | Control protocol (§3.4) |
+| 2375 | host → guest | `lm-agent`, copying to `/run/docker.sock` | Docker Engine API |
+| 3128 | guest → host | helper, copying to `127.0.0.1:<proxy-port>` | Proxy relay (job mode only) |
+
+The guest-side listeners on 1025 and 2375 accept a connection only when its
+peer CID is 2 (the host), and close any other at once. Without
+`vsock_loopback` (not in the module allowlist, and module loading is disabled
+after boot) no other peer exists, but the check keeps a guest process from
+reaching unfiltered `dockerd` or `approve-binds` if one ever did.
+
+`lm-agent` also keeps 2375 closed until `configure` has run every step and
+the self-test has passed: before that, and for good after a `configure` that
+failed, it closes each connection at once. A `dockerd` behind a firewall that
+failed never answers the host, whatever the host does next.
+
+Port 3128 on the host is reachable by all code in the VM, including guest
+root (R8). It grants nothing without the job's proxy token.
+
+### 3.2 Boot sequence
+
+1. **initramfs `/init`** (busybox): mount devtmpfs. `insmod` `virtio_blk.ko` and
+   `erofs.ko`. Mount `/dev/vda` read-only as erofs on `/newroot`. Move `/dev`.
+   `switch_root /newroot /sbin/lm-init`. If the root does not mount, print to
+   hvc0 and `poweroff -f`. *Verified.*
+2. **`lm-init`** (PID 1):
+   - Mount `proc`, `sysfs`, `cgroup2` on `/sys/fs/cgroup`, and tmpfs on
+     `/run`, `/tmp`, `/var/log` and `/var/tmp`.
+   - `modprobe` the module set from §5.2.
+   - Set sysctls: `net.ipv4.ip_forward=1`, `net.bridge.bridge-nf-call-iptables=1`,
+     `kernel.dmesg_restrict=1`, `kernel.panic_on_oops=1`. Then, last, and
+     after every module is loaded: `kernel.kexec_load_disabled=1` and
+     `kernel.modules_disabled=1`. Both are one-way until reboot. The kernel
+     has `MODULE_SIG` without `MODULE_SIG_FORCE`, so without this guest root
+     could load any module. Anything that needs a module later (Docker loads
+     some on demand) must be in the §5.2 allowlist; WP-A's acceptance runs
+     every Docker feature the filter permits with loading disabled.
+   - After loading is disabled, `/sbin/modprobe` is a link to `lm-init`. It
+     loads nothing: it succeeds for a module that is loaded or built in, and
+     otherwise fails and writes `localmost: module request "<name>" (<module>)
+     refused: …` to the kernel log, so a missing allowlist entry shows in
+     `dmesg` (§5.2).
+   - Bring up `lo` and start `lm-agent`. (The agent mounts the data disk, in
+     `configure` step 2; §3.5.) If the
+     agent exits, for any reason, `lm-init` syncs and powers off. It never
+     restarts it: the agent's state (bind approvals, the relay, the
+     `configure` result, the `dockerd` it started) cannot be rebuilt, and
+     `configure` is accepted only once. The helper then reports `stopped`
+     with reason `guest`, and `VmManager` marks the VM failed.
+   - Reap zombies. Power off when the agent asks.
+3. **`lm-agent`**: listen on vsock 1025 and 2375, and on `/run/localmost/agent.sock`
+   (0600, root). Wait for `configure`.
+
+### 3.3 In-guest layout
+
+```
+/sbin/lm-init
+/sbin/modprobe -> lm-init                loads nothing after boot; logs each refused request (§3.2)
+/etc/localmost/modules                   the module load order the build wrote (§5.2)
+/etc/localmost/release.json              guestVersion, agentProtocol, dataFormat and the Alpine release, for hello
+/Users  /Volumes  /private               empty: the share's mount roots (§3.4 step 3)
+/usr/libexec/localmost/lm-agent
+/usr/libexec/localmost/lm-bindpin
+/usr/libexec/localmost/runc              the real runc (Alpine runc package, moved)
+/usr/bin/runc                            lm-runc, the wrapper
+/usr/libexec/localmost/x86_64/busybox    static x86-64 busybox (Alpine x86_64 busybox-static), for the Rosetta self-test (named busybox so the multiplexer runs the applet: binfmt CF does not preserve argv0)
+/etc/docker/daemon.json                  below
+/etc/resolv.conf                         "nameserver 198.18.0.1"
+/var/run -> ../run
+/var/lib/docker                          data disk (ext4, label lmdata)
+/var/lib/containerd                      bind of /var/lib/docker/.containerd
+/run/docker.sock  /run/localmost/agent.sock  /run/rosetta (virtiofs "rosetta")
+<share mount path>                       virtiofs "work", under a tmpfs on its top-level directory
+```
+
+`/etc/docker/daemon.json`, exactly:
+
+```json
+{
+  "hosts": ["unix:///run/docker.sock"],
+  "storage-driver": "overlay2",
+  "features": { "containerd-snapshotter": false },
+  "iptables": true,
+  "ip6tables": false,
+  "ipv6": false,
+  "userland-proxy": false,
+  "live-restore": false,
+  "dns": ["198.18.0.1"],
+  "log-driver": "json-file",
+  "log-opts": { "max-size": "10m", "max-file": "2" }
+}
+```
+
+The classic graph-driver store is chosen because jobs are pinned to the classic
+builder (`DOCKER_BUILDKIT=0`). WP-A confirms that `docker build` with
+`DOCKER_BUILDKIT=0` works against it. *Verified:* `dockerd` 29.5.3 starts with
+this configuration (without `dns` and the log options), iptables on, overlay2,
+and cgroup v2.
+
+### 3.4 Agent protocol (vsock 1025)
+
+Framing and limits are the same as §2.4. Requests look like
+`{"v":1,"id":<int>,"op":"…",…}`. The answer is `{"v":1,"id":…,"ok":true,…}` or
+`{"v":1,"id":…,"ok":false,"code":"…","message":"…"}`. Requests on one
+connection are handled in order. Electron keeps one connection and treats every
+answer as hostile input: it validates the schema, bounds every string, and never
+uses an answer to choose a host path.
+
+| op | Request fields | Answer fields | Timeout |
+|---|---|---|---|
+| `hello` | – | `agent` (semver), `guestVersion`, `kernel`, `agentProtocol`: 1 | 5 s |
+| `configure` | `vmId`, `mode`, `timeUnixMs`, `share`: `{ "tag": "work", "mountPath": <S>, "nonceFile": ".localmost-share" }` (job), `rosetta`: bool, `relay`: `{ "address": "198.18.0.1", "port": 3128, "vsockPort": 3128 }` (job) | `docker`: `{ version, apiVersion, minApiVersion }`, `disk`: `formatted`, `existing` or `corrupt`, `nonce` (≤ 64 chars, job), `rosetta`: `ok`, `absent` or `broken`, `selftest`: `{ rules, internalNoRelay, internalForgedRejected, gatewayRejected, bridgeReachesRelay, outsideRejected }`, each a bool | 60 s |
+| `approve-binds` | `container` (64 hex), `binds`: up to 64 × `{ source, destination, readOnly }` | – | 10 s |
+| `set-time` | `unixMs` | – | 10 s |
+| `status` | – | `dockerd`: `running` or `exited`, `uptimeMs` | 10 s |
+| `shutdown` | – | – (the answer comes first, then the agent stops `dockerd` with SIGTERM and waits up to 15 s, syncs, unmounts the data disk, and powers off) | 10 s |
+
+`configure` is accepted once. A second one answers `E_CONFIGURED`. `configure`
+does these steps in order and stops at the first failure, answering with its
+code:
+
+1. Set the clock from `timeUnixMs`.
+2. Data disk. If `/dev/vdb` has no ext4 superblock, run `mke2fs -t ext4 -F -q -L lmdata`
+   (`formatted`). Otherwise run `e2fsck -n`; if it finds errors, answer
+   `disk: corrupt` with `ok: false` and code `E_DISK`. Mount it on
+   `/var/lib/docker`.
+3. Share (job mode). `mountPath` must be absolute and normalised (no `.`, `..`,
+   `//` or NUL), at most 1024 bytes, and its top-level component must be one of
+   the guest root's mount roots — `Users`, `Volumes` or `private`, the empty
+   directories the read-only root ships for this — or `E_SHARE_PATH`. (The
+   root is read-only, so a tmpfs can only cover a directory it already has;
+   every other top-level name is refused, which also keeps the tmpfs from
+   hiding a directory the guest uses. `private` is where the Mac's temporary
+   directories resolve; the Linux root has no `/private` of its own.) Mount a tmpfs on `/<top>`, `mkdir -p`, then
+   `mount("work", mountPath, "virtiofs", MS_NOSUID|MS_NODEV|MS_NOSYMFOLLOW)`
+   (`E_SHARE_MOUNT`). Read `nonceFile` with `O_NOFOLLOW`, capped at 64 bytes.
+4. Rosetta (when `rosetta`). Mount virtiofs `rosetta` on `/run/rosetta`, mount
+   `binfmt_misc`, and write this to `register`:
+   `:rosetta:M::\x7fELF\x02\x01\x01\x00\x00\x00\x00\x00\x00\x00\x00\x00\x02\x00\x3e\x00:\xff\xff\xff\xff\xff\xfe\xfe\x00\xff\xff\xff\xff\xff\xff\xff\xff\xfe\xff\xff\xff:/run/rosetta/rosetta:CF`.
+   Run `/usr/libexec/localmost/x86_64/busybox true`. The result is `ok` or
+   `broken`; with `rosetta: false` it is `absent`. This step never fails
+   `configure`.
+5. Network (job mode). Create a dummy interface `lm0` with `198.18.0.1/32`,
+   bring it up, and apply the rules in §3.6. Start the relay: TCP listen on
+   `198.18.0.1:3128`, and for each connection dial vsock CID 2 port 3128 and copy
+   bytes both ways. Subscribe to Docker's network and container events once
+   `dockerd` is up (step 6): network events keep `LOCALMOST-RELAY` in step
+   (§3.6), and a container's `destroy` drops its bind approvals. In refresh
+   mode there is no `lm0` and no relay, but the rules still apply. A failure
+   here answers `E_SELFTEST` with no `selftest` field: the firewall cannot be
+   trusted either way, and Electron treats both alike.
+6. Start `dockerd --config-file /etc/docker/daemon.json`. Wait up to 30 s for
+   `GET /_ping` on `/run/docker.sock` (`E_DOCKERD`, with the last 20 log lines,
+   each at most 512 bytes). Electron strips control characters and ANSI
+   escapes from these lines, and from every other string the guest supplies,
+   before it logs them.
+7. Self-test (§3.6). In job mode every field is checked, and any `false`
+   fails with `E_SELFTEST`. In refresh mode, which has no relay and no share,
+   only `rules` is checked: the answer still carries all five fields, the
+   other four `false` (not run), and Electron checks `rules` alone. A refresh
+   answer with `rules: false` fails with `E_SELFTEST`.
+
+The agent holds approvals for at most 4096 containers at once (`E_BINDS`
+past that). A container's approvals are dropped when Docker destroys it, so
+the bound is on containers that exist; approvals of a container destroyed
+while the event stream was reconnecting stay until the VM stops.
+
+Guest-local op on `/run/localmost/agent.sock`, used only by `lm-bindpin`:
+`{"v":1,"id":1,"op":"binds-for","container":"<id>"}` answers
+`{"v":1,"id":1,"ok":true,"binds":[…]|null}`.
+
+Agent error codes: `E_PROTO`, `E_UNKNOWN_OP`, `E_CONFIGURED`, `E_NOT_CONFIGURED`,
+`E_DISK`, `E_SHARE_PATH`, `E_SHARE_MOUNT`, `E_DOCKERD`, `E_SELFTEST`, `E_BINDS`.
+
+### 3.5 Disks in the guest
+
+`/dev/vda` is the erofs root, read-only. `/dev/vdb` is the data disk: ext4,
+label `lmdata`, mounted on `/var/lib/docker`, with `.containerd/` bound onto
+`/var/lib/containerd`. *Verified:* `mke2fs` in the guest, and `dockerd` on it.
+
+### 3.6 Firewall and self-test
+
+Applied with `iptables` (the nft backend) before `dockerd` starts:
+
+```
+iptables -N LOCALMOST-RELAY
+iptables -N LOCALMOST-INPUT
+iptables -A LOCALMOST-INPUT -i lo -j ACCEPT
+iptables -A LOCALMOST-INPUT -m conntrack --ctstate ESTABLISHED,RELATED -j ACCEPT
+iptables -A LOCALMOST-INPUT -d 198.18.0.1/32 -p tcp --dport 3128 -j LOCALMOST-RELAY
+iptables -A LOCALMOST-INPUT -p tcp -j REJECT --reject-with tcp-reset
+iptables -A LOCALMOST-INPUT -j REJECT --reject-with icmp-port-unreachable
+iptables -I INPUT 1 -j LOCALMOST-INPUT
+iptables -N LOCALMOST-NOROUTE
+iptables -A LOCALMOST-NOROUTE -o lm0 -p tcp -j REJECT --reject-with tcp-reset
+iptables -A LOCALMOST-NOROUTE -o lm0 -j REJECT --reject-with icmp-net-unreachable
+iptables -N DOCKER-USER
+iptables -A DOCKER-USER -j LOCALMOST-NOROUTE
+iptables -I OUTPUT 1 -j LOCALMOST-NOROUTE
+```
+
+In a job VM the agent also adds `ip route add default dev lm0`, and `lm-init`
+sets `net.ipv4.icmp_ratelimit=0`. A job VM has no NIC, so this route goes
+nowhere: it exists so that a connection to anything off the guest is routed
+into the dummy `lm0` and reset by `LOCALMOST-NOROUTE`, from a container
+(through `FORWARD`, where `dockerd` evaluates `DOCKER-USER` first and keeps
+its rules) or from the guest itself (through `OUTPUT`). Without the route the
+kernel answers such a packet with its own unreachable, which it rate-limits,
+so a raw connect that ignored the proxy settings hung until its SYN timeout.
+*Verified*, WP-A acceptance after the integration review: five connects in a
+row to `1.1.1.1:443` from the default bridge and from the guest's namespace
+are each refused (ECONNREFUSED), in about 100 ms with the `docker run`; from
+an `internal` network the connect still fails with ENETUNREACH (no route).
+
+`LOCALMOST-RELAY` accepts the relay address only from the bridges of routable
+networks. It starts with `-A LOCALMOST-RELAY -i docker0 -j ACCEPT` (the
+default bridge). The agent follows Docker's network events: on `create` of a
+bridge network that is not `internal`, it appends `-i br-<first 12 of id>
+-j ACCEPT`; on `destroy`, it deletes that rule. On `create` it first deletes
+any rule another network left on the new network's bridge interface (a
+missed `destroy`), whether or not the new network is routable. Each time it
+subscribes to the event stream, the first time and after every reconnect, it
+rebuilds the chain from Docker's list of networks: `-F LOCALMOST-RELAY`, the
+`docker0` rule, then one rule per routable network. A packet that falls
+through `LOCALMOST-RELAY` returns to `LOCALMOST-INPUT` and is rejected. Until
+the event is handled, a new routable network cannot reach the relay, which
+fails closed. *Verified*, WP-A acceptance: a new network's rule appears and a
+container on it reaches the relay; after `network rm` the rule is gone.
+
+Why the interface match matters: the relay address is on `lm0`, and Linux
+accepts a packet for any local address on any interface (the weak-host
+model). `NET_RAW` is in Docker's default capabilities, so a container on an
+`internal` network can send a frame to its gateway's MAC with destination
+`198.18.0.1`, whatever its routing table says. Matching on the destination
+alone would accept it. The backstop behind this rule is the proxy token,
+which is injected only into routable containers. The filter does not also
+drop `NET_RAW` for internal containers: the interface match is enough, and
+dropping it would break `ping` inside internal networks. *Verified*, WP-A
+acceptance, from a real `internal` network: a TCP connect bound to `eth0`
+(`SO_BINDTODEVICE`, which `NET_RAW` allows; with no route Linux takes the
+relay address as on the link and the bridge answers its ARP) is reset, a
+hand-made SYN sent the same way gets a RST and never a SYN-ACK, and a
+`0.0.0.0` listener in the guest is refused from the gateway. `AF_PACKET` is
+not available at all (§5.2), and `AF_VSOCK` from a container fails with
+EPERM under Docker's default seccomp profile, so a container cannot dial the
+relay's vsock port around the firewall.
+
+REJECT, not DROP, so that a DNS lookup or a direct connection fails at once
+instead of timing out. *Verified:* with no listener on `198.18.0.1:53`,
+`dockerd`'s own registry lookup failed immediately.
+
+Self-test, using `iproute2` network namespaces, after `dockerd` is up:
+
+- `rules`: `iptables -S LOCALMOST-INPUT` and `iptables -S LOCALMOST-NOROUTE`
+  equal, line for line, the golden output in
+  `guest/internal/firewall/testdata/localmost-input.txt` and
+  `localmost-noroute.txt`; `INPUT` starts with the jump to `LOCALMOST-INPUT`,
+  `OUTPUT` and `DOCKER-USER` with the jump to `LOCALMOST-NOROUTE`, and
+  `FORWARD` with `dockerd`'s jump to `DOCKER-USER`. `iptables -S` prints rules in canonical form,
+  not as they were written. The expected form for iptables-nft 1.8 is below;
+  WP-A replaces it with the verbatim capture from the pinned `iptables`
+  package and checks the file in:
+
+  ```
+  -N LOCALMOST-INPUT
+  -A LOCALMOST-INPUT -i lo -j ACCEPT
+  -A LOCALMOST-INPUT -m conntrack --ctstate RELATED,ESTABLISHED -j ACCEPT
+  -A LOCALMOST-INPUT -d 198.18.0.1/32 -p tcp -m tcp --dport 3128 -j LOCALMOST-RELAY
+  -A LOCALMOST-INPUT -p tcp -j REJECT --reject-with tcp-reset
+  -A LOCALMOST-INPUT -j REJECT --reject-with icmp-port-unreachable
+  ```
+- `internalNoRelay`: a namespace on a scratch bridge that is not in
+  `LOCALMOST-RELAY`, with no default route, cannot connect to
+  `198.18.0.1:3128` (ENETUNREACH).
+- `internalForgedRejected`: the same namespace, given a host route to
+  `198.18.0.1` through its gateway (which delivers the same packet a raw
+  socket would), gets a reset, never a connection.
+- `gatewayRejected`: the same namespace, connecting to a listener the agent
+  opens on `0.0.0.0` at the scratch bridge's gateway address, gets a reset or
+  unreachable, never a connection.
+- `bridgeReachesRelay`: after the scratch bridge is added to
+  `LOCALMOST-RELAY`, with a default route through that gateway, it connects to
+  `198.18.0.1:3128`.
+- `outsideRejected`: that namespace, and then the guest's own, connecting to
+  `192.0.2.1:443` (TEST-NET-1, off the guest), each get a reset at once
+  (ECONNREFUSED). A timeout, or the kernel's rate-limited unreachable, fails
+  it: either means `LOCALMOST-NOROUTE` is not what refused the connection.
+
+The scratch bridge, its relay rule and the namespace are removed afterwards.
+*Verified behaviour that motivates this:* in the spike, a container on an
+`internal` network could not reach `198.18.0.1`, but did reach a `0.0.0.0`
+listener on its gateway (R8). The spike did not test forged frames.
+
+### 3.7 `lm-runc` and `lm-bindpin`
+
+- `lm-runc` (`/usr/bin/runc`) looks at the subcommand in its arguments. If it
+  is `create`, `run` or `restore`, it reads `--bundle <dir>` (default: the current
+  directory) and adds
+  `{"path":"/usr/libexec/localmost/lm-bindpin","args":["lm-bindpin"],"timeout":10}`
+  to `hooks.createRuntime` in `<dir>/config.json`. Hooks already there are
+  kept. The file is written back through a temporary file and a rename. Then,
+  for every subcommand, it runs `execve("/usr/libexec/localmost/runc", argv)`.
+- `lm-bindpin` follows the steps in [the design's rule 7](vm-docker-backend.md#the-share-layout-rule).
+  It enters the mount namespace from Go by locking its OS thread and calling
+  `unshare(CLONE_FS)` and then `setns`. It identifies each share-backed mount
+  by its mount id from `mountinfo`, reaches it only through `openat2` with
+  `RESOLVE_NO_SYMLINKS | RESOLVE_NO_MAGICLINKS | RESOLVE_BENEATH` from an fd on
+  the container rootfs (or `open_tree` under the same resolution), checks the
+  fd's mount id with `statx(STATX_MNT_ID)`, and clears the flag with
+  `mount_setattr(fd, "", AT_EMPTY_PATH, …)`, only after every mount has
+  passed every check. Any error, including an agent that cannot be reached,
+  exits 1 when a share-backed mount is present. In the mount table it
+  matches each share mount's root, mount point and per-mount `ro` flag
+  against the approvals, and it requires every approval that a
+  share-backed `config.json` mount matched to be one of those share mounts:
+  an approved source that `runc` resolved off the share is refused. Its
+  failure message on stderr, which `runc` passes through to the job, is
+  `localmost: bind <source> -> <destination> was not approved for this container`,
+  with ` (as mounted; …)` added when the mount table failed, or
+  `localmost: bind <source> -> <destination> is not a mount of the share (its source resolved elsewhere)`.
+  `dockerd` cuts the hook's stderr short in the error it returns, so a
+  client may see only the start of either message. The mount point is where
+  `runc` actually mounted: an image whose destination path goes through a
+  symlink (`/app -> /usr/src/app`) is refused, and the message says so.
+  *Verified primitive:* `mount_setattr(…, {attr_clr: MOUNT_ATTR_NOSYMFOLLOW})`
+  on a child bind of a `nosymfollow` virtiofs mount clears only that flag and
+  keeps `ro,nosuid,nodev`.
+
+**Bind matching.** An `ApprovedBind` and a mount in `config.json` are compared
+after the same normalisation, done once in TypeScript (the evaluator) and once
+in Go (the hook), with shared test vectors in
+`guest/internal/mountinfo/testdata/binds.json`:
+
+- `source`: the pinned host real path, exactly as the filter forwarded it in
+  the create body. It is absolute and already clean; it is compared byte for
+  byte, never re-cleaned or resolved.
+- `destination`: `path.posix.normalize`, then any trailing `/` removed (except
+  for `/` itself). The evaluator now parses destinations out of `Binds` and
+  `Mounts` (today its `MountRequest` has only `source` and `mode`), and
+  refuses a relative destination. `dockerd` cleans destinations the same way
+  (`/data/` becomes `/data`).
+- `readOnly`: in the evaluator, from the bind's `ro` mode or `Mounts[].ReadOnly`;
+  in `config.json`, true when the mount's `options` contain `ro` or `rro`
+  (dockerd and runc write `rro`, recursive read-only, for a read-only bind on
+  this version; *verified*, WP-A).
+- One approval list per container. Each mount must match one approval; each
+  approval may be used by at most one mount. The same source approved twice
+  with different destinations or modes is two approvals, each matched on
+  all three fields. Two binds to the same destination are refused by the
+  evaluator, as `dockerd` refuses them.
+
+### 3.8 Refresh mode
+
+`lm.mode=refresh`, no share, no Rosetta, no relay. Its `vmId` uses slot `0`.
+Electron loads, through `docker.sock`, only the images in the repository's
+`refs.json` whose config digests are not already in `meta.json` (or all of
+them when the refresh starts from a blank disk, §6.5). It removes every image
+that is not in that list, and every tag. Then it sends `shutdown`. The helper
+`F_FULLFSYNC`s the disk and reports `stopped` with `synced: true`.
+
+## 4. Guest image: artifacts and build
+
+### 4.1 In the app bundle
+
+```
+localmost.app/Contents/Resources/guest/
+  vmlinux             raw arm64 Image, unpacked from Alpine's EFI zboot vmlinuz (~36 MB)
+  initramfs.cpio.gz   busybox-static, virtio_blk.ko, erofs.ko, /init (~0.8 MB)
+  rootfs.erofs        the read-only root, lz4hc (~90–130 MB)
+  manifest.json       below
+  LICENSES.md         each package's license field, the Alpine aports commit, and the source offer
+```
+
+`manifest.json` (`schema: 1`):
+
+```json
+{
+  "schema": 1,
+  "guestVersion": "2026.10.0",
+  "dataFormat": 1,
+  "agentProtocol": 1,
+  "alpine": { "branch": "v3.24", "release": "3.24.2" },
+  "kernel": { "package": "linux-virt-6.18.54-r0", "release": "6.18.54-0-virt" },
+  "docker": { "engine": "29.5.3", "apiVersion": "1.54", "minApiVersion": "1.40", "containerd": "2.3.6", "runc": "1.4.3" },
+  "artifacts": {
+    "vmlinux": { "sha256": "…", "size": 0 },
+    "initramfs.cpio.gz": { "sha256": "…", "size": 0 },
+    "rootfs.erofs": { "sha256": "…", "size": 0 }
+  },
+  "modules": ["virtiofs", "…"],
+  "packages": [{ "name": "…", "version": "…", "arch": "aarch64", "repo": "main", "sha256": "…", "license": "…" }],
+  "baseline": {
+    "ServerVersion": "29.5.3", "OSType": "linux", "Architecture": "aarch64",
+    "OperatingSystem": "localmost guest (Alpine Linux v3.24)", "KernelVersion": "6.18.54-0-virt",
+    "Driver": "overlay2", "CgroupVersion": "2", "SecurityOptions": ["name=seccomp,profile=builtin", "name=cgroupns"]
+  }
+}
+```
+
+`packages[].arch` is `aarch64`, or `x86_64` for the static busybox of the
+Rosetta self-test.
+
+`baseline` is recorded by the build's smoke boot (§4.3, step 7) from the real
+daemon's `/info`, restricted to the filter's `/info` allowlist. The filter
+answers a VM-less `/info` from it, and `/version` from `docker`.
+
+### 4.2 Pinned inputs
+
+`scripts/guest/packages.lock.json` lists each package as `name`, `version`,
+`repo`, `arch`, `sha256` and `size`, fetched from
+`https://dl-cdn.alpinelinux.org/alpine/v3.24/<repo>/aarch64/<name>-<version>.apk`.
+The first lock uses the versions the spike ran (sha256 of the `.apk` file):
+
+| Package | Version | sha256 |
+|---|---|---|
+| linux-virt | 6.18.54-r0 | `9a4a6fa042b60b70f453dded99762810516b35793c64d776d75986b0b110b6e0` |
+| docker-engine | 29.5.3-r1 | `03aa8eedb196b41b6fe70663f910c71b2620ce68fa1eee6d6e4517daf1bf734c` |
+| containerd | 2.3.6-r0 | `ecab78ddbe9851666f0a83b677a845ff029c282d810e37eb871cd99bf16b66d6` |
+| runc | 1.4.3-r1 | `79dff71ca3b63ce2516b803f0405beb403ecdbd324028bca2d3d57b7f17283ef` |
+| tini-static | 0.19.0-r3 | `1cab1e98b70661fb92f53309f2dd7c2526c615eca9a1f57badc86b66f90607bc` |
+| iptables | 1.8.13-r0 | `9d22aef2e74346e9d537f6dc964786ab14b35580e3ccc0e4001dc3a725e8fe77` |
+| nftables | 1.1.6-r1 | `e350dc0ae7667486f925a6719add6df562055799baf0e402077ef2b11839ac9e` |
+| busybox-static | 1.37.0-r31 | `965777e06b94bf11981d5f4ecdfcd577879f4b0dda544294d1dd3f72b217bc75` |
+| e2fsprogs | 1.47.4-r0 | `52fd401e79ce6b0ff7648733ba4de3135083cd0132543534e72106e7ea767a00` |
+| erofs-utils (build VM only) | 1.9.1-r0 | `327e99ccadd7523bd00018e87f437b7f7a27eb6dbd2b5f9cdf0d3e794061136f` |
+| musl | 1.2.6-r2 | `5e9674b7f41152fe2119093b5cb4c13eaaadb19c2d5422b2d7267913e663ee6e` |
+
+The dependency closure (`libseccomp`, `libmnl`, `libnftnl`, `libxtables`,
+`libcrypto3`, `lz4-libs`, `zlib`, `libuuid`, `libblkid`, `libcom_err`,
+`e2fsprogs-libs`, `libeconf`, `ca-certificates`, and so on) is resolved from
+`APKINDEX` by `fetch.mjs --update-lock` and pinned the same way. `iproute2` is
+added for the self-test. The x86-64 self-test binary comes from the x86_64
+`busybox-static` of the same release.
+
+`--update-lock` verifies the `APKINDEX.tar.gz` signature with Alpine's public
+keys, which are checked in under `scripts/guest/keys/`. A normal build checks
+only the file hashes. The Go toolchain is pinned by `toolchain` in `guest/go.mod`.
+
+### 4.3 Build: `npm run build:guest` → `build/guest/`
+
+It runs on macOS 14+ on Apple silicon, with no Docker and no root, and
+outside any localmost job: a job's seatbelt profile grants no
+`file-issue-extension`, so VZ shares cannot work inside one, and hosted CI
+runners have no nested virtualization (R28). In practice it runs on the
+owner's Mac, as a step of `docs/release-checklist.md`. It needs Node, Go (for
+the `guest/` module) and Xcode's `swiftc`. Its output is cached
+under a hash of the lock file, `guest/`, `scripts/guest/` and the kernel config
+check.
+
+1. `fetch.mjs`: download to `build/guest-cache/apks/` and check each sha256.
+2. `unzboot.mjs`: read `vmlinuz-virt` from the linux-virt apk *in memory*. The
+   PE file has magic `zimg` at offset 4, the payload offset (u32 LE) at 8, the
+   size at 12, and the compression name at 24 (it must be `gzip`). Gunzip the
+   payload and check for the arm64 magic `ARMd` at 0x38. Write `vmlinux`.
+   *Verified.*
+3. `check-config.sh` (pinned from moby v29.5.3 `contrib/`) against the apk's
+   `config-*`. The build fails on a missing "generally necessary" item.
+4. `go build` for `lm-init`, `lm-agent`, `lm-runc` and `lm-bindpin` with
+   `GOOS=linux GOARCH=arm64 CGO_ENABLED=0 go build -trimpath -ldflags='-s -w -buildid='`.
+   *Verified:* a static Go guest binary built this way ran in the guest.
+5. `compose.mjs`: from the apk *data tars read in memory* and never extracted
+   onto the Mac's filesystem, build `rootfs.tar`. The Mac's volume is
+   case-insensitive and would merge files: *verified*, 13 name pairs in
+   `linux-virt` and `iptables` alone. The tar holds:
+   - the packages;
+   - the module closure (§5.2), stored uncompressed, with `modules.dep` and its
+     siblings rewritten from `.ko.gz` to `.ko`;
+   - the localmost binaries, `daemon.json` and `resolv.conf`;
+   - the `/var/run` link and the empty directories.
+
+   Every entry has uid and gid 0, mtime 0, and sorted order. `compose.mjs` also
+   writes `initramfs.cpio.gz` (newc, sorted, mtime 0, gzip mtime 0) and the
+   build VM's own initramfs: busybox-static, the erofs-utils and e2fsprogs
+   closure, the virtiofs, virtio_blk, erofs, loop and ext4 modules, and
+   `build-init`. *Verified:* both newc archives are reproducible.
+6. **Build VM.** `build/guest-tools/vzrun` is compiled from
+   `scripts/guest/vzrun.swift` with `swiftc -O` and ad-hoc signed with
+   `entitlements.virtualization.plist`. It boots `vmlinux` plus the build
+   initramfs, with the directory holding `rootfs.tar` shared read-only as tag
+   `share` and an output directory as tag `out`. The guest runs
+   `mkfs.erofs -zlz4hc --all-root -T0 -U 00000000-0000-0000-0000-000000000001 --tar=f /out/rootfs.erofs /in/rootfs.tar`,
+   then powers off. *Verified:* 0.3 s for a small root and 5.3 s for the full
+   one. The image mounted and its binaries ran. Two builds were byte-identical.
+7. **Smoke boot.** `vzrun` boots the result with a scratch data disk in refresh
+   mode. It checks `hello` and `configure`, and records `baseline` and `docker`
+   from the daemon. With `--vsock-unix 1025:<path>` and `--vsock-unix
+   2375:<path>`, `vzrun` exposes guest ports as unix sockets, like the helper
+   does. It is also the development harness for the guest. Its copies
+   half-close: when one direction ends, the other side's write is shut down
+   and the other direction keeps going (a Docker client half-closes an
+   attach stream once its stdin is done, and the output must still arrive).
+   `npm run build:guest -- --write-fixture` then rewrites
+   `test/fixtures/vm-guest-daemon-answers.json` from these answers, the
+   filter test's recorded fixture; nothing else changes that file.
+8. Write `manifest.json` with the sha256 and size of each artifact, and write
+   `LICENSES.md`.
+
+## 5. Electron side
+
+### 5.1 Modules and their boundaries
+
+| File | Status | Owns |
+|---|---|---|
+| `src/main/docker/docker-backend.ts` | rewritten | The `DockerBackend` and `WorkerDocker` interfaces (below), `runnerWorkspaceRoot()`, and `noDockerBackend`: what `RunnerManager` serves when it is given no backend, a worker whose socket answers every request with `no Docker daemon is available to this job` (`NO_DAEMON_MESSAGE`), never a fallback daemon. `DesktopBackend` and `LegacyDockerBackend` are deleted (WP-E). |
+| `src/main/vm/vm-backend.ts` | new | `VmBackend implements DockerBackend`: `name = 'vm'`, `supportsPrivileged = false` (privileged stays refused, owner decision 2), `disposable = true`. `workspaceMountRoot` is the same as today's. |
+| `src/main/vm/vm-manager.ts` | new | Admission gate, boot, readiness, stop, `sweep()`, `onResume()`, `shutdownAll()`, the spare. |
+| `src/main/vm/helper-client.ts` | new | Spawn through `sandbox-exec`, NDJSON framing, the events and commands of §2.4, exit mapping. |
+| `src/main/vm/helper-profile.ts` | new | `buildHelperProfile()` (§2.5). |
+| `src/main/vm/agent-client.ts` | new | §3.4 over `agent.sock`, with schema validation of every answer. |
+| `src/main/vm/guest-image.ts` | new | Locate `<resources>/guest`, read `manifest.json`, check the artifact hashes once per launch. |
+| `src/main/vm/cache-disks.ts` | new | §6.5. |
+| `src/main/vm/types.ts` | new | Declarations only: `VmRequest`, `VmState`, `VmHandle`, `VmError`, `VmManager` (below), `AgentClient` (§3.4, below), `ImagePuller` (§6.4), `CacheDisks` and `StartRefreshVm` (§6.5). The implementations import them from here, so that no two of them import each other. |
+| `src/main/vm/paths.ts` | new | Every path in §1, each built only from an id checked against its §1 form (a malformed one throws): `vmDir()`, `vmJobFiles()`, `imageStoreDir()`, `refsJsonPath()`, `cacheFiles()`, `sandboxDirOf()` and `sandboxFiles()`, which take `<data>` as an argument, already realpathed by the caller (`sandboxFiles(<data>, sandboxId)` is built on `sandboxDirOf()`, never from a directory the caller hands over, because the share is what the helper profile grants). Also the §1 regexes, `repoKeyOf()`, `newVmId(slot)`, `vmIdSlot()`, `digestHex()` (§6.3), `blobPath()` (§6.3, with its second layer `placeBlob()` exported only for its test), `getVmResourcesDir()` (§1), `guestDir()`, `helperPath()` (with the `LOCALMOST_VM_HELPER` rule of §7.3) and `dockerCliPath()`; and the names `SHARE_DIR_NAME` (`_work`), `SHARE_NONCE_FILE` and `DOCKER_CONFIG_DIR_NAME` (`.docker`), which `buildSandbox`, the job profile and runner-manager share. |
+| `src/main/resource-monitor/memory-pressure-monitor.ts` | new | Polls `sysctl -n kern.memorystatus_vm_pressure_level` every 5 s with async `execFile` (1 → `normal`, 2 → `warn`, 4 → `critical`; anything else → `warn`), and calls `vmManager.onMemoryPressure(level)` on a change. |
+| `src/main/docker/puller/registry-client.ts` | new | Registry v2 client: token auth (anonymous first, the operator's credentials only on a refusal, §6.1), manifests, blobs, redirects, screened DNS. |
+| `src/main/docker/puller/image-store.ts` | new | The per-repository blob store and `refs.json`. |
+| `src/main/docker/puller/docker-archive.ts` | new | The `docker save`-shaped tar stream for `POST /images/load`. |
+| `src/main/docker/puller/image-puller.ts` | new | `ImagePuller` (§6.4). |
+| `src/main/docker/registry-auth.ts` | changed | Adds `resolveRegistryCredentials(registry): Promise<RegistryCredentials \| undefined>` for the puller, where `RegistryCredentials` is `{ kind: 'basic', username, password }` or `{ kind: 'identity-token', token }`. The sync `resolveRegistryAuth`, which built the X-Registry-Auth header `DesktopBackend`'s filter attached, is deleted with its tests (at integration), and a test keeps the name out of `src` and `test`. The new function is async. It looks helpers up only in `/opt/homebrew/bin`, `/usr/local/bin` and `/Applications/Docker.app/Contents/Resources/bin`, never `PATH`, and runs them with async `execFile` (10 s timeout). Throws `RegistryAuthError` when a configured helper is missing or fails other than "not found", with the design's message naming the helper and the config key (`credsStore` or `credHelpers.<registry>`) and how the helper ended (exit status, signal, timeout, or an answer over 64 KiB). What the helper printed never goes into that error, which reaches the job's log: it goes, cleaned, to the `log` option, and `index.ts` passes `resolveRegistryCredentials(r, { log: (m) => logger.warn(m) })`. The registry client calls it only when a registry refuses an anonymous request, once per registry per job (§6.1). |
+| `src/main/docker/docker-filter-proxy.ts` | changed | §5.3. |
+| `src/main/docker/docker-evaluator.ts` | changed | Parses and normalises bind destinations from `Binds` and `Mounts` (§3.7 "Bind matching"; today `MountRequest` has only `source` and `mode`), refuses a relative or duplicate destination, and returns `approvedBinds` on an allowed create. |
+| `src/shared/docker-policy.ts` | changed | `UNFILTERED_EGRESS` becomes `PROXIED_EGRESS` = `egress through this job's proxy, subject to its network allowlist`. `hasDockerGrants(policy)` is exported. The approval text for `pull.registries` adds `and fetching from wherever that registry redirects (any public https host)`. The `privileged: true` refusal no longer says "this build does not have a managed VM backend"; it says `privileged containers are not granted: they reach the Docker VM's kernel`. |
+| `src/shared/docker-access.ts` and its tests | deleted | Only `DesktopBackend` used `resolveDockerEndpoint`. |
+| `src/main/runner-downloader.ts` | changed | `buildSandbox` makes `<sandbox>/_work` and `<sandbox>/.docker` (§1). `writeShareNonce(sandboxDir): string` writes the nonce with `wx`. |
+| `src/main/process-sandbox.ts` | changed | The `shareDir` and `dockerCli` options (§5.5). |
+| `src/main/runner-manager.ts` | changed | §5.4. |
+| `src/main/config.ts` | changed | `dockerVm` (§5.6). |
+| `src/main/index.ts` | changed | Build `VmBackend` and `VmManager`. `sweep()` before the pool starts, `shutdownAll()` on quit, `onResume()` on `powerMonitor` `resume`. |
+| `src/main/auto-updater.ts` | changed | `autoDownload = true`. |
+
+```ts
+// src/main/docker/docker-backend.ts
+export interface DockerBackend {
+  readonly name: string;
+  readonly supportsPrivileged: boolean;
+  /** True when the daemon is thrown away with the worker, so no removal sweep is needed. */
+  readonly disposable: boolean;
+  workspaceMountRoot(sandboxDir: string, repository?: string): string;
+  forWorker(ctx: WorkerContext): WorkerDocker;
+}
+
+export interface WorkerContext {
+  slot: number;
+  /** As buildSandbox made it. The backend realpaths it once, at construction. */
+  sandboxDir: string;
+  sandboxId: string;
+  /** Written by writeShareNonce before the worker started. */
+  shareNonce: string;
+  /** The repository the worker was spawned for, if any (for the spare). */
+  spawnRepository?: string;
+  /** The worker's ProxyServer, read when needed: its port and its token-bearing URL. */
+  proxy(): { port: number; url: string };
+  log(entry: { level: 'debug' | 'info' | 'warn'; message: string }): void;
+}
+
+export type EndpointState = { kind: 'ready'; socketPath: string } | { kind: 'none'; reason: string };
+
+/** Normalised as in §3.7 "Bind matching": source byte-exact, destination cleaned. */
+export interface ApprovedBind { source: string; destination: string; readOnly: boolean }
+
+export interface DockerProgress {
+  status?: string; id?: string; progress?: string;
+  progressDetail?: { current?: number; total?: number };
+  error?: string; errorDetail?: { message: string };
+}
+
+export interface PullRequest {
+  registry: string;             // e.g. docker.io
+  repositoryPath: string;       // e.g. library/alpine
+  tag?: string; digest?: string;
+  platform?: string;            // the request's ?platform=, if any
+}
+
+export interface WorkerDocker {
+  /**
+   * At the claim, with the bound policy. Boots nothing: the VM boots at the
+   * job's first request that needs the daemon (endpoint with `boot`).
+   * Idempotent: runner-manager calls it at least twice per job
+   * (onJobAcquired, then the "Running job" line), and possibly on a previous
+   * spawn's socket that is still stopping.
+   *  - The first bind with hasDockerGrants(policy), while release() has not
+   *    been called: records the repository the VM is for, and adopts the
+   *    spare if it was booted for this repository, or else stops the spare.
+   *  - Any later bind for the same repository: replaces the policy only.
+   *  - A later bind without grants: replaces the policy (the filter then
+   *    refuses everything but the baseline, and no request boots a VM) and
+   *    leaves a running VM alone.
+   *  - A bind for a different repository than the first: stops the VM, if
+   *    one is running, and never boots another; the socket stays closed.
+   *  - Any bind after release() has started: records nothing, boots nothing.
+   */
+  bind(repository: string, policy: DockerPolicy): void;
+  /** When the worker is spawned and dockerVm.prewarm is on. Boots none while another worker's spare lives. */
+  prewarm(): void;
+  /**
+   * At a claim that leaves the socket closed (a job of another repository
+   * than the spawn's, or a policy that drifted): stop the spare, if any.
+   * The filter's staysClosed(reason) calls it.
+   */
+  dropSpare(reason: string): void;
+  /**
+   * The VM's docker.sock once ready. Waits while it boots, up to timeoutMs.
+   * With `boot`, a request that needs the daemon: the first one boots the
+   * bound job's VM, exactly once, and every one waits for it, then gets the
+   * same answer, the boot's failure included. Without, only a VM that is
+   * already there counts (the stop's removal of the job's containers).
+   */
+  endpoint(timeoutMs: number, options?: { boot?: boolean }): Promise<EndpointState>;
+  /** A VM is ready right now: the baseline is forwarded, not synthesised. */
+  running(): boolean;
+  /** The synthesised answers of §5.3 "Baseline". */
+  baseline(path: '/_ping' | '/version' | '/info'): { status: number; headers: Record<string, string>; body: unknown };
+  pull(req: PullRequest, onProgress: (p: DockerProgress) => void, signal: AbortSignal): Promise<void>;
+  /**
+   * The image id (`sha256:<config digest>`) a pull by digest in this job
+   * resolved `<registry>/<repositoryPath>@<digest>` to, or undefined. The
+   * VM's classic image store cannot find a loaded image by a digest
+   * reference (§6.4 step 5), so the filter looks it up here. (Added by WP-D.)
+   */
+  imageForDigest(req: PullRequest): string | undefined;
+  approveBinds(containerId: string, binds: ApprovedBind[]): Promise<void>;
+  /** HTTP(S)_PROXY, http(s)_proxy and NO_PROXY for routable containers and builds; {} when no VM. */
+  containerProxyEnv(): Record<string, string>;
+  /**
+   * Worker exit: stop the VM, delete its directory, have the puller forget
+   * the job, schedule a cache refresh. Idempotent. A no-op for a job whose VM
+   * never booted, and no request boots one once it has begun.
+   */
+  release(): Promise<void>;
+}
+```
+
+```ts
+// src/main/vm/types.ts (VmManager is implemented in vm-manager.ts)
+export interface VmRequest {
+  mode: 'job' | 'refresh';
+  /** 1–99 for a job; 0 for a refresh. Refreshes queue behind every job boot at the admission gate. */
+  slot: number;
+  sandboxId?: string; shareRealPath?: string; shareNonce?: string;   // job
+  repository: string; repoKey: string;
+  proxyPort?: number;                                                // job
+  /** Job only: dockerVm.prewarm's spare; admitted after every job, at normal pressure only. */
+  spare?: boolean;
+}
+export type VmState = 'queued' | 'booting' | 'ready' | 'stopping' | 'stopped' | 'failed';
+export interface VmHandle {
+  readonly vmId: string;
+  readonly dockerSocketPath: string;
+  state(): VmState;
+  /** Resolves on configure success; rejects with a VmError. */
+  ready(): Promise<{ docker: { version: string; apiVersion: string }; rosetta: 'ok' | 'absent' | 'broken'; bootMs: number }>;
+  agent(): AgentClient;
+  stop(reason: string): Promise<void>;
+  /**
+   * Resolves once the helper has exited and the VM's directory is gone,
+   * however it stopped, and never rejects: the helper's `stopped` event
+   * (§2.4), or `{ reason: 'killed', synced: false }` when the helper exited
+   * without one. A refresh promotes its disk only on `synced: true` (§6.5).
+   */
+  stopped(): Promise<{ reason: 'guest' | 'requested' | 'error' | 'killed'; synced: boolean }>;
+  /** Why it failed, once state() is `failed`: at boot, or `running` after it was ready. */
+  failure(): VmError | undefined;
+}
+export interface VmManager {
+  sweep(): Promise<void>;
+  start(req: VmRequest): VmHandle;       // admission-gated; never blocks the caller
+  /** Make a live spare an ordinary job VM (VmBackend adopts it at the claim, booted already); false if it is gone. */
+  claimSpare(vmId: string): boolean;
+  onResume(): void;
+  onMemoryPressure(level: 'normal' | 'warn' | 'critical'): void;
+  shutdownAll(): Promise<void>;
+}
+/** An Error naming where the VM failed; `code` is a §2.4 or §3.4 code, or VmManager's own. */
+export interface VmError extends Error {
+  stage: 'admission' | 'disk' | 'helper' | 'agent' | 'configure' | 'nonce' | 'running';
+  code: string;
+}
+```
+
+VmManager's own codes: `E_CANCELLED` (stopped before ready; its stage is the
+one the stop interrupted, `admission` while queued), `E_NO_DISK` (below the
+free-space floor: "not enough free disk for a Docker VM"), `E_VM_DIR`,
+`E_AGENT_SILENT` (no hello within 30 s), `E_AGENT` (the agent client failed
+other than by a code of its own), `E_CONFIGURE` (`configure` failed other
+than by a code), `E_SELFTEST` (an answer whose self-test failed, §3.4 step 7),
+`E_NONCE`, `E_DISK_FULL` ("host disk nearly full"), `E_VM_STOPPED` (a guest
+power-off after ready, other than a refresh VM's synced one, below) and `E_VM`
+(anything else thrown in a boot, with the stage it was in);
+`AgentClient` adds `E_AGENT_CLOSED`, `E_AGENT_TIMEOUT`, `E_AGENT_PROTOCOL` and
+`E_AGENT_UNKNOWN` (a refusal code not in §3.4).
+
+A refresh VM ends by powering off after CacheDisks sends `shutdown`: a
+`stopped` event with reason `guest`, `synced: true` and exit 0 is a clean stop
+(state `stopped`, no failure). Any other end of a ready VM, a refresh VM's
+unsynced power-off included, is `failed` at stage `running`.
+
+**The spare.** There is at most one. `start()` with `spare: true` throws while
+another spare lives (queued, booting, ready or stopping, and not yet claimed);
+`VmBackend` then boots none for that worker. A job that finds the gate full
+takes the spare's slot: the spare is stopped with the reason `a job needs its
+slot`. A VM holds its slot at the gate from its admission until its helper has
+exited, so a VM that failed still counts while its helper is on its way out.
+
+**The sweep's pid check.** `sweep()` sends SIGKILL to a `helper.pid` only when
+that pid's executable is `helperPath()`. The executable is the text vnode as
+`lsof -a -p <pid> -d txt -Fn` names it, not `ps -o comm=`, which on macOS is
+the argv[0] a process gave itself. A job VM whose disk was a
+clone of the golden disk and whose `configure` answers `E_DISK` is the one
+boot that is tried again: the golden disk is discarded and the VM boots once
+more on a blank disk.
+
+```ts
+// src/main/vm/types.ts: §3.4 over agent.sock. Every answer is schema-checked
+// and bounded before it is returned; a refusal rejects with the agent's code.
+export interface AgentClient {
+  hello(): Promise<{ agent: string; guestVersion: string; kernel: string; agentProtocol: 1 }>;
+  configure(req: AgentConfigureRequest): Promise<AgentConfigureResult>;   // the §3.4 fields
+  approveBinds(container: string, binds: ApprovedBind[]): Promise<void>;
+  setTime(unixMs: number): Promise<void>;
+  status(): Promise<{ dockerd: 'running' | 'exited'; uptimeMs: number }>;
+  shutdown(): Promise<void>;
+  close(): void;
+}
+```
+
+### 5.2 Guest module set
+
+The roots are `virtiofs`, `vmw_vsock_virtio_transport`, `virtio_blk`,
+`virtio-rng`, `ext4`, `erofs`, `overlay`, `br_netfilter`, `veth`, `dummy`,
+`nf_tables`, `nft_compat`, `nft_chain_nat`, `nft_nat`, `nft_masq`,
+`xt_addrtype`, `xt_conntrack`,
+`xt_MASQUERADE`, `xt_nat`, `xt_mark`, `xt_tcpudp`, `xt_set`,
+`ip_set_hash_net`, `nf_conntrack_netlink`, `ipt_REJECT`, `iptable_filter`,
+`iptable_nat` and `binfmt_misc`. Added by WP-A, each from a refused request
+in `dmesg`:
+
+- `nft_nat` and `nft_masq`: `nft_chain_nat` alone did not carry the
+  iptables-nft DNAT/MASQUERADE rules Docker's networks set up.
+- `xt_tcpudp` (`ipt_tcp`, `ipt_udp`): `iptables` checks the `tcp` and `udp`
+  matches' revisions against the kernel. Without it, Docker's embedded DNS
+  failed on every user-defined network (`Resolver Start failed` for
+  `-t nat -I DOCKER_OUTPUT -d 127.0.0.11 -p udp --dport 53 -j DNAT …`), and
+  `iptables -S` warned `Extension tcp revision 0 not supported`.
+- `nf_conntrack_netlink` (`nfnetlink-subsys-1`): `dockerd` deletes a
+  container's conntrack entries when its address is released. Without it
+  that failed (`Failed to delete conntrack state`), and a stale entry could
+  let a later container with the same address match `LOCALMOST-INPUT`'s
+  `ESTABLISHED` rule.
+- `xt_set` (`ipt_set`) and `ip_set_hash_net`: Docker's bridge driver checks
+  for the `set` match and uses a `hash:net` set of its bridges.
+
+Three requests are refused by design, and are the only refusals WP-A's
+acceptance allows in `dmesg`: `net-pf-10` (IPv6 is off, `ipv6.disable=1`),
+`net-pf-17` (`af_packet`: raw packet sockets, which Docker's default
+`CAP_NET_RAW` would open to every container; `dockerd` wants them only to
+send unsolicited ARP when an address is reused, and logs a warning without)
+and `net-pf-16-proto-6` (`xfrm_user`: IPsec for encrypted overlay networks,
+which a single-host guest has none of). The build takes their closure through
+`modules.dep`, and `manifest.modules` records the final list. WP-A adds a root
+only when `dockerd` or `check-config.sh` shows it is needed. It is an
+allowlist. Because `lm-init` sets `kernel.modules_disabled=1` once these are
+loaded (§3.2), anything `dockerd` or `iptables` would load on demand must be
+in the list: WP-A's acceptance exercises every Docker feature the filter
+permits (bridge and internal networks, embedded DNS, published-port refusal,
+builds) with loading disabled, reads `dmesg` afterwards, and fails on any
+refused request but the three above.
+
+### 5.3 Filter changes (`DockerFilterProxy`)
+
+- **Options.** `backend: DockerBackend` stays. Add `worker: WorkerDocker`.
+  Remove `attachRegistryAuth`.
+- **`bind()`** calls `worker.bind()` after recording the policy. Nothing
+  boots at the bind.
+- **Endpoint.** A permitted request that needs the daemon (anything but the
+  baseline below, and including an upgraded attach) awaits
+  `worker.endpoint(bootTimeoutMs, { boot: true })`: the job's first such
+  request boots its VM, and it and every request that comes while the VM
+  boots wait for it. A request the filter refuses never asks. The stop's
+  removal of the job's containers asks `worker.endpoint(0)`, which boots
+  nothing. If it answers `none`, the request gets 503 with the reason (the
+  boot's failure, for every request that waited on it), and the first such
+  answer is also logged at warn.
+- **Baseline.** When `!worker.running()`, `/_ping`, `/version` and `/info` are
+  answered from `worker.baseline()`. Otherwise they are forwarded, and `/info`
+  is rewritten as today. The synthesised answers, from the guest manifest
+  (§4.1), with `<api>` = `min(manifest.docker.apiVersion, maxApiVersion)`, the
+  same clamping the forwarded path applies:
+  - `GET` and `HEAD /_ping`: `200`, body `OK` (empty for `HEAD`), headers
+    `Api-Version: <api>`, `Ostype: linux`, `Docker-Experimental: false`,
+    `Builder-Version: 1`, `Cache-Control: no-cache, no-store, must-revalidate`,
+    `Pragma: no-cache`, `Content-Type: text/plain; charset=utf-8`. Never
+    `Builder-Version: 2`, which would steer the CLI to BuildKit.
+  - `GET /version`: `200`, `application/json`, the same `Api-Version`,
+    `Ostype` and `Docker-Experimental` headers, and exactly these body
+    fields: `Version` = `docker.engine`, `ApiVersion` = `<api>`,
+    `MinAPIVersion` = `docker.minApiVersion`, `Os` = `linux`, `Arch` =
+    `arm64`, `KernelVersion` = `baseline.KernelVersion`, and
+    `Components: [{ "Name": "Engine", "Version": docker.engine }]`. No
+    `Experimental`: dockerd omits it when false (`omitempty`), so the
+    synthesised answer must too. No `GitCommit`, `GoVersion` or `BuildTime`.
+  - `GET /info`: `200`, `application/json`, `manifest.baseline` exactly, plus
+    `NCPU` = `dockerVm.cpus` and `MemTotal` = `dockerVm.memoryMiB` in bytes,
+    the two INFO_FIELDS that describe the VM's size rather than its software.
+
+  The forwarded answers get the same treatment: `Api-Version` clamped on
+  `/_ping` and on `/version` (header and body), and `/_ping`'s
+  `Builder-Version` rewritten to `1`, since dockerd 29 says `2`.
+
+  A test (vm-backend.test.ts) compares each synthesised answer, field by
+  field, with the forwarded and rewritten one: the filter relays dockerd's
+  own answers from the guest build's smoke boot, which `npm run build:guest
+  -- --write-fixture` records in `test/fixtures/vm-guest-daemon-answers.json`
+  together with the smoke VM's size, and the synthesised side uses the same
+  manifest fields and that size. The forwarded `MemTotal` is the guest
+  kernel's, a little under the configured size.
+- **Daemon answers are hostile input.** With guest root (a kernel bug, or
+  `privileged` if it is ever granted), `dockerd`'s answers are the job's to
+  choose, and Electron main is shared by every job. Every daemon answer the
+  filter or the puller buffers to parse is capped at `MAX_JSON_BODY_BYTES`
+  (1 MiB), as `/info` already is: the create answer (`relayCreate`), the
+  network-create answer, `/version`, the puller's inspect answer (its
+  `/images/…/json` probe), and the load and tag answers. Over the cap, the
+  connection is destroyed and the job gets 502 `the Docker VM sent an
+  oversized answer`. Answers the filter does not parse - the container,
+  network and image inspects a job reads, logs, attach, the load progress -
+  are piped, never buffered. Parsed answers are schema-checked like agent
+  answers: a container create answer and a network create answer must each
+  carry a 64-hex `Id`, or the job gets 502 and nothing is recorded as its
+  own. (A network id becomes an alias key, a path in forwarded URLs and the
+  `NetworkMode` pinned into later creates, so an id like `host` must never be
+  owned.)
+- **Credentials of any kind never enter the VM.** `X-Registry-Auth` and
+  `X-Registry-Config` are stripped from every forwarded request, `/build`
+  included (`forwardedHeaders` already does this; a test keeps it). `POST
+  /auth` is not in the endpoint allowlist and stays refused, and so do the
+  checkpoint endpoints (a test asserts both).
+- **Pull.** An allowed `POST /images/create` with `fromImage` is never
+  forwarded. The filter answers `200 application/json` and streams
+  `worker.pull()` progress, one JSON object per line. A failure after the
+  headers is sent as `{"errorDetail":{"message":…},"error":…}`. A job's own
+  `X-Registry-Auth` header is dropped. Before `worker.pull()`, the filter
+  refuses with 400 a digest that is not `^sha256:[0-9a-f]{64}$` ("only sha256
+  digests can be pulled"; §1: a digest the job chose is outside input) and a
+  `?platform=` that is not `linux/arm64` or `linux/amd64` with an optional
+  `/v<digit>` variant, case-insensitive (§6.2). A tag written before a digest
+  (`name:tag@sha256:…`) is ignored, as the docker CLI ignores it. For a pull by digest, the worker
+  records the `configDigest` the puller returned under the request's
+  `<registry>/<repositoryPath>@<digest>` (normalized as the puller does:
+  registry lowercased, `library/` for a single-name Docker Hub image; a
+  `name:tag@digest` reference is keyed by its digest, as Docker does), and
+  `worker.imageForDigest()` answers it for the rest of the job.
+- **Digest references.** The guest's classic image store finds a loaded
+  image by a tag or by its id, never by `name@sha256:…`: the load cannot
+  record a repo digest, only a registry pull can (verified live on dockerd
+  29.5.3, overlay2: after the puller's load, inspect and create of
+  `name@<index digest>` and of `name@<manifest digest>` answer 404, and
+  `sha256:<config digest>` works). So, after the policy check on the
+  reference as the job wrote it, the filter rewrites a digest reference that
+  `worker.imageForDigest()` knows to that image id: the create's `Image`,
+  and the name in `GET /images/{name}/json`. One it does not know is
+  forwarded as it is and gets dockerd's 404, which makes the CLI pull (`docker
+  run`), after which it is known. A classic build's `FROM name@sha256:…`
+  cannot be rewritten (the filter does not read the Dockerfile) and fails
+  even after a pull; `FROM name:tag` after a `docker pull` works.
+- **Create.** On an allowed create:
+  1. If the network is routable (the default bridge, `bridge`, or a network the
+     job created with `internal: false`), merge `worker.containerProxyEnv()`
+     into `Config.Env`, keeping any variable the job already set.
+  2. Forward the request.
+  3. On a 201, parse `Id` (64 hex) from an answer capped at
+     `MAX_JSON_BODY_BYTES` and `await worker.approveBinds(Id, verdict.approvedBinds)`.
+     Only then record the container (id and name) as the job's own, and send
+     the answer to the job. A start by name that arrives earlier (the job
+     chose the name, so it need not wait for the answer) is refused by the
+     filter, because the container is not yet the job's own. The security
+     argument still rests on `lm-bindpin` failing closed, not on this
+     ordering.
+  4. If the approval fails, `DELETE /containers/<Id>?force=1` and answer 500:
+     `could not register the approved binds with the job's Docker VM`.
+- **Build.** Merge `worker.containerProxyEnv()` into the `buildargs` query
+  (URL-encoded JSON), keeping the job's values. On a build failure whose stream
+  names a registry host lookup, log the base-image rule once.
+- **Stop.** Skip `removeOwned()` when `backend.disposable`, then call
+  `await worker.release()`.
+- **Log lines** that the e2e suite matches:
+  - `pulled <ref> (<manifest digest>, <platform>) on the Mac; loaded into VM <vmId>`
+  - `... ; already in VM <vmId>`
+  - `forwarded <METHOD> <path>` (unchanged), which a pull never logs
+  - `pulled <METHOD> <path> through the worker, not forwarded` (the filter's, at debug)
+  - `denied …` / `refused …` (unchanged)
+
+### 5.4 runner-manager lifecycle hooks
+
+| When | Call |
+|---|---|
+| `startInstance`, after `buildSandbox` | `shareNonce = writeShareNonce(sandboxDir)`, stored on the instance. |
+| `startDockerProxy` | `new DockerFilterProxy({ backend, worker: backend.forWorker({ slot, sandboxDir, sandboxId, shareNonce, spawnRepository, proxy, log }), … })`. Then, if `config.dockerVm.prewarm`, `worker.prewarm()`. |
+| Job env | Keep `DOCKER_HOST` and `DOCKER_BUILDKIT=0`. Add `DOCKER_CONFIG=<sandbox>/.docker`, an empty directory made by `buildSandbox`, so the CLI reads no operator config. Prepend `dirname(<docker-cli>)` to `PATH`. |
+| Profile | `spawnSandboxed(…, { shareDir: <sandbox>/_work, dockerCli: <docker-cli>, vmHelper: <helper> })` |
+| `bindDockerSocket` (the claim) | `socket.bind()` now calls `worker.bind()`, which records the repository and policy and boots nothing: the VM boots at the job's first request that needs the daemon (§5.1, §5.3), so a job that never makes one has no VM, no helper and no disk. Where the socket stays closed (the claim is not for the spawn repository, or the policy drifted), `socket.staysClosed(reason)` calls `worker.dropSpare(reason)`, so a spare that no job of this worker will use is stopped at the claim, not at the worker's exit. It is reached from `onJobAcquired` → `applyPolicyForTarget` and again from `applyRepoPolicy` at the "Running job" line; `startInstance` can also reach a previous spawn's socket while its un-awaited `stopDockerProxy` is still running. vm-backend tests cover a double bind, a bind while stopping, a job that never asks for the daemon, and concurrent first requests. |
+| `stopDockerProxy` (worker exit, reap, app stop) | Unchanged. `socket.stop()` now releases the VM. |
+| App start (`index.ts`) | `await vmManager.sweep()` before the pool's first spawn. |
+| App quit | `await vmManager.shutdownAll()`: every helper is stopped with `graceMs: 0` and awaited, 10 s at most. |
+| `powerMonitor` `resume` | `vmManager.onResume()`: `set-time` to every ready VM; the spare is stopped. |
+| Memory pressure (`memory-pressure-monitor.ts`, §5.1) | `vmManager.onMemoryPressure(level)`: at `warn`+, no spare and no refresh starts; at `critical`, new boots are queued. |
+
+### 5.5 Job profile additions (`process-sandbox.ts`)
+
+After `(allow file-read* file-write* (subpath "<sandbox>"))` and the docker
+socket rules:
+
+```scheme
+;; The Docker VM's share and the sandbox around it, as nodes: the job cannot
+;; rename, replace, chmod or relink either (VZ resolves the share at start).
+(deny file-write* (literal "<sandbox>/_work") (literal "<sandbox>"))
+;; The share's tripwire nonce: neither readable nor writable by the job, so a
+;; match in the guest proves VZ shared the directory localmost made.
+(deny file-read* file-write* (literal "<sandbox>/_work/.localmost-share"))
+;; The bundled docker CLI, and nothing else of the app bundle.
+(allow file-read* (literal "<docker-cli>") (literal "<dirname of docker-cli>"))
+```
+
+After `(allow process*)`, which lets the job run what it likes:
+
+```scheme
+;; The helper carries the virtualization entitlement: the job may not run it.
+(deny process-exec* (literal "<helper>"))
+```
+
+Seatbelt execs a Mach-O the profile cannot read, so the read deny on the
+bundle does not keep the job from running the helper; this rule does. A
+literal is enough: exec is matched on the path it resolves to (a link, `..`
+or a case variant of the name is refused too), and the job can neither read
+the helper to copy it nor hard-link it. Without the rule a job could boot VZ
+VMs of its own through the helper, outside the admission gate (they would
+have no share, since the job profile issues no extension).
+
+The three file denies are new in `process-sandbox.ts`, which today re-allows the
+whole sandbox subtree, its own node included. (The `localmost test` profile
+in `src/shared/sandbox-profile.ts` already denies its workspace node the
+same way.) The sandbox test checks them in the constructed and ambient modes,
+including `mv _WORK x`, `mv ../<SANDBOX in other case> x` and
+`renamex_np(RENAME_SWAP)`, and the helper deny with a compiled stand-in at
+the helper's path (constructed) and the packaged helper (ambient).
+
+The job profile is deny-default and has no `file-mount` rule, and none is
+ever added: that is what keeps a job from mounting a DMG, FUSE or SMB
+filesystem over `_work` or anywhere inside it, which the share's path-based
+grant would then hand to VZ (§2.1; the helper's device and mount-point
+checks are only a point-in-time backstop). Seatbelt's write rules do not
+stop such a mount on their own. The sandbox test asserts, in both the
+constructed and the ambient form, that `hdiutil attach -nobrowse
+-mountpoint` of a DMG onto `_work` and onto a directory inside it fails.
+
+`<data>/vm` needs no rule. It is inside `<data>`, which is already denied in full.
+
+### 5.6 Configuration (`config.yaml`)
+
+```yaml
+dockerVm:
+  prewarm: false        # boot one spare VM for the next spawned worker (memory for latency)
+  cpus: 4               # per VM; default min(4, physical cores)
+  memoryMiB: 8192       # per VM; committed lazily, returned only when the VM stops
+  maxRunning: 0         # 0 = auto: max(1, floor(physical RAM GiB / 8))
+  dataDiskGiB: 64       # every VM's sparse data disk, and the most set aside for one (below)
+  bootTimeoutSec: 60    # how long a docker request waits for the job's VM
+  cacheLimitGiB: 20     # per repository: golden disk and image store, LRU at refresh
+  pullMaxGiB: 10        # compressed bytes one pull may fetch
+  jobPullMaxGiB: 30     # compressed bytes all of one job's pulls may fetch
+  minFreeGiB: 20        # free space on <data>'s volume under which boots and pulls are refused
+```
+
+A job VM's data disk is made at `dataDiskGiB`, the golden disk's size, so
+that it can always clone the golden disk (`prepareJobDisk` clones only a
+golden disk no larger than `sizeGiB`, §6.5). It is sparse: what it takes on
+the Mac is what the guest writes. What a boot reserves is a fair share of the
+free space, not the disk's size: `min(dataDiskGiB, max(8 GiB, share))` is set
+aside for it, where
+
+```
+share = (free − minFreeGiB − headroom still promised to running VMs)
+        / (claimants − VMs already holding a disk)
+```
+
+The claimants are the VMs that may want a disk at once: one per runner slot,
+the spare when `prewarm` is on, and a cache refresh, but never more than
+`maxRunning`, as the gate admits no more. A running VM's promised headroom is
+what was set aside for it minus what its disk has allocated since it was made
+(for a clone, past the golden disk's blocks it shares, which take no free
+space); until a job's disk has been made and measured, its whole share counts.
+The disks are read before free space, so a disk that grows between the reads
+counts as used, not as free. The sum and the new disk's share are taken in
+one turn of the event loop, so two boots sized at once never count the same
+space. A boot with under 8 GiB above the floor and that headroom is refused
+with 503 `not enough free disk for a Docker VM`.
+
+A share is a reservation, not a cap: a VM running alone may use more of its
+disk while the other claimants sit idle. One that writes into space the
+others were promised is what the free-space watch below stops; image pulls
+are refused under the floor on their own (§6.3).
+
+A refresh VM's disk is made by `CacheDisks` at `dataDiskGiB` too (§6.5), and
+is never refused here. What it writes is the cache it loads: at most
+`min(cacheLimitGiB, dataDiskGiB)`, less what its clone of the golden disk
+holds already. That much is set aside for it, as far as that leaves each other
+claimant still without a disk the 8 GiB minimum, and never less than its fair
+share.
+
+`VmManager` checks free space every 10 s while VMs run; under `minFreeGiB / 2`
+it stops the job VM whose disk grew most (wrote most past what it was made
+with), with the reason `host disk nearly full`.
+
+All of these are optional. Out-of-range values are clamped and logged. No
+setting enables a fallback daemon.
+
+## 6. Puller and cache
+
+### 6.1 Registry client
+
+It uses Node `https` with the `lookup` screening that `ProxyServer` already
+applies (`egress-screen.ts`), so a registry name that resolves to a loopback,
+link-local or private address is refused, and so is plain `http:` (the
+design's "Registries on the LAN, loopback or plain HTTP"). `docker.io` maps to
+`registry-1.docker.io`, with `library/` for single-name images. The
+`Accept` header lists OCI index and manifest types and Docker manifest-list
+and schema2 types. Schema1 is refused. Auth is the
+`WWW-Authenticate: Bearer realm=…,service=…,scope=…` token exchange (or a
+registry's own `Basic` challenge), under the rules below.
+
+**Anonymous first.** Every request goes without the operator's credentials
+first: a bearer challenge is answered with an anonymous token request. The
+credentials are asked for (`resolveRegistryCredentials`) only when the
+registry refuses: a 401 from its own origin that the anonymous answer did not
+cure, for a manifest or a blob, or a token service that answers an anonymous
+token request 401 or 403. Then the challenge is answered once more, with them.
+They are asked for at most once per registry per job: the puller keeps what
+one job's sessions were given, an answer and a failure alike, keyed by
+registry (`CredentialMemo`), and forgets it when the job's VM is released. So
+a registry that serves everything anonymously never has its credential helper
+run, and a helper that is missing, hangs or fails is an error only for an
+image that needed it (`RegistryAuthError`, naming the helper and the config
+key, as §5.1 says). That error first says why the helper ran: `<registry>
+refused an anonymous pull of <repository> (private, or no such repository), so
+localmost asked for credentials: …`, since Docker Hub refuses a repository
+that does not exist the way it refuses a private one. Requests of one session
+that are refused while the ask runs all wait for that one ask. A session
+records whether it sent the credentials (`usedCredentials`), which §6.3 "Which
+store" reads. A session can be told to refuse them (`refuseCredentials()`): a
+refusal that only they would answer then fails with
+`CredentialsRequiredError`, and nothing is asked for or sent; an `anonymous`
+session always does.
+
+**Redirects.** Followed (CDN blob hosts) only to `https:` URLs, at most 5
+hops, each hop screened. Electron main follows them, so any registry in
+`pull.registries` can send Electron to any public https host, outside the
+job's `network.allow`; the approval text and `SECURITY.md` say so.
+
+**Where credentials go.**
+
+- The registry's origin is the scheme, host and port of its API endpoint
+  (`https://registry-1.docker.io` for `docker.io`). An `Authorization` header,
+  bearer or basic, is sent only on a request to that origin that is not a
+  redirect hop. Every redirect hop is sent with no `Authorization` and no
+  cookies, whatever its origin.
+- The token realm comes from the registry's `WWW-Authenticate` challenge, so
+  the registry chooses it. It must be `https:`, and its host must pass the
+  same screening. Otherwise the pull fails (`the registry's token service
+  <realm> is not a public https URL`). Basic credentials from
+  `resolveRegistryCredentials` are sent only to a realm that passed, only in the
+  token request, and never on a redirect of it.
+- The bearer token from the realm is sent only to the registry's origin.
+- Only a 401 from the registry's own origin, on the request itself (not a
+  redirect hop), is answered. A 401 from a redirect target fails the request
+  (`<host> (where the registry redirected) answered 401; localmost answers
+  only the registry's own challenge`), whatever challenge it carries, and no
+  credentials are sent anywhere.
+- Each request answers at most one challenge with what the session already
+  has, so a token that expires during a pull (Docker Hub's last 300 s) is
+  renewed and the request retried once, and at most one more with the
+  operator's credentials, the first time the session needs them; a 401 after
+  that is the answer.
+- `RegistryClientOptions.connectTo` and `ca` exist for the mock registry
+  only, and the client refuses them when `app.isPackaged`. Production passes
+  neither.
+
+**Foreign and non-distributable layers.** A descriptor with a `urls` field, or
+with media type `application/vnd.docker.image.rootfs.foreign.diff.tar.gzip`
+or `application/vnd.oci.image.layer.nondistributable.*`, is refused before
+anything is fetched (`image layer <digest> must be fetched from a URL the
+image names, which localmost does not do`). Electron never fetches a URL an
+image names.
+
+### 6.2 Platform choice
+
+For an index, choose `linux/arm64` (any variant, `v8` first). If there is none,
+or the request asks for `linux/amd64`, choose `linux/amd64`. If that choice
+needs Rosetta and the VM's Rosetta is not `ok`, fail with the design's message.
+A single-platform manifest is used as it is. Its config's `architecture` must
+be `arm64` or `amd64`, and the same Rosetta rule applies.
+
+### 6.3 Verification and store
+
+**Digests are validated before any use.** The registry, and anyone who can
+publish an image on an allowed registry such as docker.io, chooses every
+digest the puller sees: manifest, config, layer and index-entry descriptor
+digests, the config's `diff_ids`, a pull-by-digest reference, and the
+`Docker-Content-Digest` header. Store paths are built from digests, and a
+failed blob is deleted, so an unchecked digest such as `sha256:../../..`
+would give Electron main, running with the user's full rights, a path
+traversal read and delete. So:
+
+- Every digest from a registry, from the VM (image ids in `/images/…/json`
+  and load answers) or from `refs.json` must match `^sha256:[0-9a-f]{64}$`
+  before it is used for anything. Any other algorithm (`sha512:` included) or
+  form is refused: `the registry sent a malformed digest for <ref>`.
+- Store paths are built only from the validated 64-hex part, by one function
+  (`blobPath(storeRoot, hex)`) that re-checks the hex and asserts the result
+  is a direct child of `<storeRoot>/blobs/sha256` named exactly `<hex>`. "Under
+  the store root" would not be enough: a per-job store's root is the VM's
+  directory, beside `helper.sb` and `data.img`.
+- A manifest is identified by the SHA-256 of the raw bytes fetched, never by
+  `Docker-Content-Digest`. The header is at most a hint for the `HEAD`
+  comparison in §6.4 step 1; a manifest that is used is always hashed, and a
+  pull by digest requires that hash to equal the requested digest.
+- The image-store and registry-client tests include traversal-shaped and
+  wrong-algorithm digests in every position above.
+
+**Size limits, enforced while bytes stream.** Compressed bytes fetched by one
+pull are capped at `pullMaxGiB`, and by all of a job's pulls at
+`jobPullMaxGiB`. A descriptor whose declared `size` exceeds what is left is
+refused before the fetch, and a blob that streams past its declared `size`
+is cut off and refused. A layer's decompressed bytes may not exceed 64 MiB
+plus 100 times its compressed size, nor `pullMaxGiB` × 4. Before a pull, and
+every 256 MiB during it, free space on `<data>`'s volume must stay above
+`minFreeGiB`. Each limit fails the pull with a message naming the limit and
+the config key.
+
+**Store.** Each blob is streamed to `blobs/sha256/.tmp-<random>` while its
+SHA-256 is computed. It is renamed into place only if the digest matches the
+descriptor. Each layer is decompressed (gzip, or zstd through Node's
+`zlib.zstdDecompress`, which needs Node 22.15 or later; Electron 43's Node is
+24.18), and its uncompressed SHA-256 must equal the config's validated
+`diff_ids[i]`. The manifest, the config and (for a multi-platform image) the
+index are stored beside the layers once the whole image has verified, so a
+later pull of the same tag needs only the `HEAD`. `refs.json` is
+`{ "v": 1, "refs": [ … ] }`, one entry per reference and platform, the newest
+replacing an older one:
+`{ ref, platform, manifestDigest, configDigest, indexDigest?, layers: [{ digest, mediaType, size, diffId, uncompressedSize }], lastPulled }`,
+where `ref` is `<registry>/<path>:<tag>` or `<registry>/<path>@<digest>`,
+`platform` matches `linux/(arm64(/vN)?|amd64)`, and `uncompressedSize` is what
+the tar header of §6.4 step 4 states before the bytes. Every value read back
+from it is validated as above, and an entry with any malformed field is
+refused and left out. Reading a blob checks its digest again. A
+blob that fails is deleted, by its validated path, and fetched again: a
+manifest or config within the same pull, and a layer (which fails as it is
+measured or as the archive of §6.4 step 4 streams) by running the fetch and
+load once more. The
+store and the golden disk share `cacheLimitGiB`. When they exceed it, the
+least recently pulled references are dropped at the next refresh: until the
+remaining references' blobs plus their estimate on the golden disk (each
+distinct uncompressed layer once) fit, then every blob no remaining reference
+holds is deleted, except blobs a pull in progress has pinned.
+
+**Which store.** When the index, manifest or config was read from the job's
+own store, the image stays in the job store, without asking: only a private
+image puts them there, and the job store answers for any registry and
+repository that names their digest, so a second pull of that digest through
+another repository (whose registry may answer anything) could otherwise carry
+a private config into the shared store. Otherwise, when a refusal had the
+pull's session ask for the operator's credentials and it got some (sent yet or
+not), then once the manifest and config are resolved and before any layer is
+fetched, the puller asks the registry anonymously for everything the public
+store would keep that the session may have fetched with them: the platform
+manifest, the index when there is one, and the config, each by its digest.
+Each is a token exchange with no credentials, then a `GET` whose bytes must
+hash to that digest. A status alone is not evidence, since a registry can
+answer `200` to anything. All three must be served, or the image is the job's.
+Asking before the layers, not after, lets them stream straight into the store
+they belong to; the digests asked about are the same either way. A pull with
+neither has fetched everything so far anonymously (§6.1) and is public without
+asking. A public image's layers are fetched anonymously too: with the
+anonymous session that asked, or with the pull's own session told to refuse
+credentials. A layer the registry then refuses (`CredentialsRequiredError`)
+makes the image need credentials after all: it becomes private, the session
+may use the credentials again, and the layers are fetched once more into the
+job store (what was already fetched anonymously stays in the public store,
+unrecorded, until the next refresh drops it). So every blob in the public
+store was served anonymously: the layers as they were fetched, and the index,
+manifest and config when they were fetched, or by the check above. If the
+registry serves them, the image is public: its blobs go to
+`<data>/vm/images/<repoKey>` and it becomes eligible for the golden disk. If
+not, its blobs go to `<data>/vm/jobs/<vmId>/blobs` and are deleted with the
+VM, it is not recorded in `refs.json` (which alone decides what a refresh
+loads, §6.5), and `notePulled` is not called. (This is option (a) of the
+design's owner decision 1, which the owner chose; option (b) would key the
+store by policy hash instead.)
+
+### 6.4 `ImagePuller`
+
+```ts
+// src/main/vm/types.ts
+export interface ImagePuller {
+  pull(opts: {
+    repository: string;                      // owner/name: the cache key
+    request: PullRequest;
+    rosetta: 'ok' | 'absent' | 'broken';
+    dockerSocketPath: string;                // the VM's
+    onProgress(p: DockerProgress): void;
+    signal: AbortSignal;
+  }): Promise<{ manifestDigest: string; configDigest: string; platform: string; source: 'registry' | 'store' | 'vm' }>;
+  /** The job of the VM with this docker.sock has ended: its pull totals and the credentials its pulls were given go. */
+  forget(dockerSocketPath: string): void;
+}
+```
+
+The steps:
+
+1. Resolve the tag with a manifest `HEAD`. If either store holds a blob
+   with the digest `Docker-Content-Digest` (validated) names, re-hashed on
+   read, use it: the stores are content-addressed, so that blob is the
+   manifest (or index) the tag names now, and `refs.json` need not be asked.
+   Otherwise `GET` the manifest (or the index, then the chosen platform's
+   manifest) and hash the raw bytes (§6.3). Parse the config descriptor.
+2. `GET /images/sha256:<configDigest>/json` on the VM, with the answer capped
+   (§5.3). If it answers 200 and its `Id` equals `sha256:<configDigest>`, skip
+   to step 5 (`source: 'vm'`, a cache-disk hit). The image id equals the
+   config digest (*verified*), so this works for an image loaded with
+   `RepoTags: null`, for which the classic store records no repo digest. A
+   check by `<name>@<manifestDigest>` would never hit.
+3. Fetch any blobs that are missing from the store (`source: 'registry'`, or
+   `'store'` if all were present).
+4. `POST /images/load` a tar holding `oci-layout`, `index.json` (annotation
+   `io.containerd.image.name` = `<registry>/<path>@<digest>`, the digest the
+   reference named or the tag resolved to: the index's for a multi-platform
+   image; the classic store ignores it, so it is a label only),
+   `manifest.json` (`RepoTags: null`), `blobs/sha256/<config>`, an OCI
+   manifest over the layers as the archive holds them (media type
+   `application/vnd.oci.image.layer.v1.tar`, digest = diff_id), which the
+   index names, and the *uncompressed* layer tars. The stream is
+   deterministic (fixed order, mtime 0, owner 0), and each layer is checked
+   again as it streams (§6.3), and never past the size its tar header states.
+   *Verified:* a Mac-built archive of this shape loaded, and the image id
+   equalled the config digest.
+5. For a pull by tag, `POST /images/sha256:<configDigest>/tag?repo=<registry>/<path>&tag=<tag>`.
+   A pull by digest is left untagged: the classic store records a repo
+   digest only on a registry pull, so the image is found by its id alone,
+   and the filter maps the reference (§5.3 "Digest references").
+6. For a public image only (§6.3 "Which store"): record it in `refs.json`,
+   and `cacheDisks.notePulled(repoKey, configDigest)`, which is a hint.
+
+The load and tag answers are capped and schema-checked like every daemon
+answer (§5.3).
+
+Pulls run in Electron main, which every job shares, and each holds a
+decompressor (zstd's window can reach 128 MiB, libzstd's default limit, which
+is kept so that images compressed with large windows load), its manifests and
+its config in memory. So one VM runs at most three pulls at once and all VMs
+together eight; the rest wait their turn, and a cancelled wait gives up its
+place. A transfer that breaks and is retried gives back what it took from the
+pull and job budgets.
+
+### 6.5 `CacheDisks`
+
+```ts
+// src/main/vm/types.ts
+export interface CacheDisks {
+  /** A clone of the golden disk (clonefile), or a new sparse file when there is none. */
+  prepareJobDisk(repoKey: string, dest: string, sizeGiB: number): Promise<'clone' | 'blank'>;
+  /** A hint, for the log: refs.json alone decides what a refresh loads. It gates nothing. */
+  notePulled(repoKey: string, configDigest: string): void;
+  /**
+   * Debounced 60 s (and run at most 10 minutes after the first schedule),
+   * one at a time per repository, held back (rescheduled) while on battery or
+   * under memory pressure. `repository` (owner/name) is what StartRefreshVm is
+   * given; it must be the one `repoKey` was made from. (WP-D added it: a
+   * refresh VM's VmRequest needs the repository, which a repoKey cannot give
+   * back.)
+   */
+  scheduleRefresh(repoKey: string, repository: string): void;
+  discard(repoKey: string, reason: 'corrupt' | 'dataFormat' | 'limit'): Promise<void>;
+}
+
+/** Injected into CacheDisks, so that it does not import VmManager (WP-D builds against a fake). */
+export type StartRefreshVm = (req: { repository: string; repoKey: string }) => VmHandle;
+```
+
+`CacheDisks` is constructed with a `StartRefreshVm` function. `index.ts`
+passes one that calls `vmManager.start({ mode: 'refresh', slot: 0, … })`.
+The handle it returns must be a slot-0 VM of this `<data>` (`0-<12 hex>`,
+its `docker.sock` where §1 puts it), or the refresh fails.
+
+`prepareJobDisk` clones only with a readable `meta.json` whose `dataFormat`
+is the guest's (a mismatch discards the golden disk), and only a golden disk
+no larger than `sizeGiB`; otherwise it makes a sparse file of `sizeGiB`.
+`VmManager` passes `dataDiskGiB`, the size the golden disk is built at, so a
+job clones whenever the golden disk is current; how much free space it may
+use is set aside separately (§5.6), not by `sizeGiB`. The
+destination must be a VM's `data.img` (§1) and must not exist. The clone is
+`clonefile(2)` through `/bin/cp -c`, because Node's `copyFile` cannot clone on
+macOS: its libuv answers `COPYFILE_FICLONE_FORCE` with `ENOSYS` and makes a
+full byte copy for `COPYFILE_FICLONE` (measured with Node 22 on macOS 26).
+Source and destination must be on one volume. Off macOS it is a plain copy.
+
+A refresh does four things:
+
+1. Choose incremental or full. It is **full** (a new blank `data.img.new`)
+   when there is no golden disk, when `meta.json`'s `guestVersion` differs
+   from the manifest's, when the golden disk was last built from blank more
+   than 7 days ago, when the previous refresh of this repository failed, when
+   the cache limit dropped references (an ext4 image does not shrink), or when
+   the golden disk's size is no longer `dataDiskGiB` (lowered, every job
+   would get a blank disk; raised, jobs would get the old size). Otherwise it
+   is **incremental**: clone `data.img` to `data.img.new`. An incremental
+   refresh with nothing to load starts no VM.
+2. Start a refresh-mode VM on it through `StartRefreshVm` (slot 0, the
+   admission gate's lowest priority). Load, through `docker.sock`, every
+   public reference in `refs.json` within the limit whose config digest is
+   not already in `meta.json` (incremental), or every one (full), streaming
+   each archive from the store. An image counts as held only once the load
+   answer names no other id and an inspect by its id finds it.
+3. `DELETE` every image whose id is not a config digest from that list,
+   remove every tag, and `shutdown`.
+4. On `stopped` with `synced: true`, rename `data.img.new` over `data.img` and
+   update `meta.json` (`dataFormat`, `guestVersion`, the config digests held,
+   when it was last built from blank, the last refresh). On any failure,
+   delete `data.img.new` and record the failure, so that the next refresh is
+   full. A `discard` while a refresh runs means that refresh is not promoted.
+
+Every refresh runs under one deadline (30 minutes by default), passed to each
+daemon call and bounding each wait on the VM (`ready()`, the agent's
+`shutdown`, `stopped()`). At the deadline the VM is stopped and the refresh
+fails as above, so a refresh VM that stops answering cannot hold the
+repository's refreshes, its slot-0 VM or its pinned blobs. The concrete
+`CacheDisks` also has `shutdown()`, which `index.ts` awaits at quit: it
+cancels scheduled refreshes, refuses new ones, and ends a running one at once
+(recorded as failed). Its `settled(repoKey)` is for tests only: on battery it
+can wait indefinitely.
+
+`meta.json` is `{ "v": 1, dataFormat, guestVersion, configDigests,
+builtFromBlankAt, lastRefreshAt, lastRefreshFailed }`; one that does not
+validate is treated as absent.
+
+## 7. Signing and packaging
+
+### 7.1 Entitlements
+
+`packaging/entitlements.virtualization.plist`:
+
+```xml
+<?xml version="1.0" encoding="UTF-8"?>
+<!DOCTYPE plist PUBLIC "-//Apple//DTD PLIST 1.0//EN" "http://www.apple.com/DTDs/PropertyList-1.0.dtd">
+<plist version="1.0">
+<dict>
+  <!--
+    The VM helper in Resources, localmost-vm: it runs one Linux VM per job
+    through Virtualization.framework, under a seatbelt profile of its own.
+    Only this. No JIT, no library-validation exemption.
+  -->
+  <key>com.apple.security.virtualization</key>
+  <true/>
+</dict>
+</plist>
+```
+
+### 7.2 `forge.config.js`
+
+```js
+const VM_HELPER = path.join(__dirname, 'build', 'localmost-vm');   // -> Resources/localmost-vm
+const GUEST_DIR = path.join(__dirname, 'build', 'guest');          // -> Resources/guest/
+const DOCKER_CLI_DIR = path.join(__dirname, 'build', 'docker-cli'); // -> Resources/docker-cli/docker
+
+packagerConfig.extraResource.push(VM_HELPER, GUEST_DIR, DOCKER_CLI_DIR);
+// MACOS_MINIMUM ('14.0') is in scripts/macos-minimum.js; the update manifest
+// (scripts/generate-latest-mac-yml.js) carries its Darwin version as
+// minimumSystemVersion (23.0.0), so an older install's updater does not offer
+// this release to a Mac on macOS 12 or 13, which could not open it.
+packagerConfig.extendInfo = { LSMinimumSystemVersion: MACOS_MINIMUM };
+
+// The app's own Resources (/localmost.app/Contents/Resources), not a nested
+// helper app's, which also ends in .app/Contents/Resources.
+const APP_RESOURCES = path.join(path.sep + `${packagerConfig.name}.app`, 'Contents', 'Resources');
+const inAppResources = (filePath, ...p) => filePath.endsWith(path.join(APP_RESOURCES, ...p));
+
+// Passed as osxSign's `ignore` inside the existing `if (shouldSign)` block.
+// The guest is data for the VM, not macOS code. Without this, osx-sign signs
+// every file isbinaryfile flags (vmlinux, the initramfs, the erofs root) and
+// gives each an xattr signature carrying the app's entitlements.
+const ignoreGuest = (filePath) => filePath.includes(path.join(APP_RESOURCES, 'guest') + path.sep);
+
+function signOptionsForFile(filePath) {
+  let plist = 'entitlements.plist';
+  if (filePath.includes('(Plugin).app')) {
+    plist = 'entitlements.plugin.plist';
+  } else if (inAppResources(filePath, path.basename(CAMERA_HELPER)) || inAppResources(filePath, 'docker-cli', 'docker')) {
+    plist = 'entitlements.none.plist';
+  } else if (inAppResources(filePath, 'localmost-vm')) {
+    plist = 'entitlements.virtualization.plist';
+  }
+  return { hardenedRuntime: true, entitlements: path.join(__dirname, 'packaging', plist) };
+}
+```
+
+`hooks.generateAssets` runs `npm run build:native`, which is `build:helper`,
+`build:guest` and `fetch:docker-cli`, each cached. `hooks.prePackage` calls
+`checkVmResources({ helper, guestDir, dockerCliDir })` from
+`scripts/check-vm-resources.js`, which also holds the allowlist:
+
+```js
+// Exactly what Resources/guest may hold; prePackage fails on anything else.
+const GUEST_FILES = ['LICENSES.md', 'initramfs.cpio.gz', 'manifest.json', 'rootfs.erofs', 'vmlinux'];
+```
+
+It fails the build if `build/guest` is not a real directory holding exactly
+`GUEST_FILES` as regular files, if `build/guest/manifest.json` is not schema 1
+naming exactly `vmlinux`, `initramfs.cpio.gz` and `rootfs.erofs` with the
+sha256 and size of each file, if `build/docker-cli` holds anything but
+`docker`, or if the helper or the CLI is missing, is a link, is not
+executable, or is not a thin arm64 Mach-O executable. A build never ships
+without its VM.
+
+### 7.3 Build scripts
+
+- `build:helper`: `swift build -c release --arch arm64 --package-path native/localmost-vm`,
+  copied to `build/localmost-vm` (so that development and packaged builds
+  both find it at `<resources>/localmost-vm`), then ad-hoc signed with
+  `entitlements.virtualization.plist` and the hardened runtime so that
+  development runs work. osx-sign re-signs it when there is an identity.
+  `scripts/build-helper.mjs` builds under `build/swift/`, and skips the copy
+  and signing when the binary and the entitlements are unchanged since the
+  last signing (`build/localmost-vm.stamp`). It needs WP-F's
+  `packaging/entitlements.virtualization.plist` and fails naming it when it
+  is missing.
+- `fetch:docker-cli`: `scripts/docker-cli.lock.json` =
+  `{ "version": "29.8.1", "url": "https://download.docker.com/mac/static/stable/aarch64/docker-29.8.1.tgz", "sha256": "5a8f5604d7673202b2af925229d15eb4bbb86f7f542e4ac8cd7aa3f14cfa0f8b", "member": "docker/docker" }`
+  is fetched, checked, and extracted to `build/docker-cli/docker` by
+  `scripts/fetch-docker-cli.mjs`. The tarball is checked in memory before
+  anything is written, and cached as `build/docker-cli-cache/<sha256>.tgz`.
+  Only the member is extracted, and only when it appears once, as a regular
+  file holding a thin arm64 Mach-O executable. The lock's `url` must be
+  `https://download.docker.com/mac/static/stable/aarch64/docker-<version>.tgz`.
+  *Verified:* hash, member, and that it is a thin arm64 Mach-O that is
+  linker-signed ad hoc.
+- Development runs find `<resources>` at the checkout's `build/`
+  (`build/localmost-vm`, `build/guest`, `build/docker-cli`), whether Electron
+  was launched on the checkout or on `build/dist/main.js` (§1), through
+  `getVmResourcesDir()`,
+  `helperPath()` and `dockerCliPath()` in `src/main/vm/paths.ts`. The helper
+  profile, the spawn and the sweep all use `helperPath()`.
+  `LOCALMOST_VM_HELPER` replaces the helper path only when `!app.isPackaged`
+  (not on `NODE_ENV`, which a packaged app's environment could set), so that
+  tests and development can run the fake helper (§8). A packaged app ignores
+  it, and a test asserts that.
+
+### 7.4 Packaging tests (`src/main/packaging.test.ts`)
+
+- `extraResource` includes the helper, `build/guest` and `build/docker-cli`.
+- `ignoreGuest` (osxSign's `ignore`) matches `Resources/guest/vmlinux` and nothing outside
+  the app's own `Resources/guest/` (checked against osx-sign's own walk of a
+  laid-out app); `prePackage` refuses a `build/guest` with a sixth file.
+- `signOptionsForFile` gives the virtualization plist to `Resources/localmost-vm`
+  and to nothing else, a nested helper app's `Resources/localmost-vm`
+  included, and gives `none` to `Resources/docker-cli/docker`.
+- `entitlements.virtualization.plist` has exactly one key.
+- `extendInfo.LSMinimumSystemVersion === '14.0'`, and the usage-description
+  test's plist fixture says `14.0`.
+- The generated `latest-mac.yml`, run through electron-updater's own
+  `checkIfUpdateSupported` with `os.release()` stubbed, is refused on Darwin
+  21 and 22 (macOS 12 and 13) and offered on Darwin 23 and later.
+- The helper and the CLI checks refuse an arm64e Mach-O (a subtype other
+  than `CPU_SUBTYPE_ARM64_ALL`), as well as Intel, universal and non-executable
+  files.
+- The "ships no entitlements file the signing does not use" test still passes.
+
+## 8. Fakes for parallel work
+
+- **Fake helper** (`test/fakes/fake-localmost-vm.mjs`, owned by WP-C). Unit
+  tests run it directly through `HelperClient`'s injected spawn function,
+  never through `sandbox-exec` (which fails nested inside a job, does not
+  exist on Linux, and whose helper profile would not let it exec `node`). It
+  takes the §2.1 argument line and applies the same checks. It emits the §2.4
+  events, and exits when its stdin closes, as the real helper does.
+  It binds `docker.sock` and `agent.sock`, connects `docker.sock` to
+  `FAKE_DOCKERD_SOCKET` (a mock daemon the test runs), and answers agent ops
+  from `FAKE_AGENT_SCRIPT`, a JSON map from op to answer or delay. A
+  `stop` or SIGTERM exits with the scripted code. The script's shape is in
+  the fake's header: per op `answer`, `error`, `delayMs`, `raw` or `close`,
+  and under `helper` the helper's own behaviour (`exitAfterListening`,
+  `stdout`, `rosetta`, `agentAfterMs`, `stopExitCode`, `stopDelayMs`,
+  `ignoreSigterm`). SIGUSR2 is the guest powering off by itself (`stopped`
+  reason `guest`), when a test chooses, rather than after a delay. A refresh
+  VM's `configure` answers the self-test as §3.4 step 7 says (rules only).
+  It reads the share's nonce from the share for `configure`, as the guest
+  does, and writes what it is told (a stop's grace, `set-time`,
+  `approve-binds`, an agent connection turned away before `agentAfterMs`) to
+  stderr as log lines. It binds its
+  sockets by name in the VM's directory, its working directory, so a long
+  `<data>` cannot overflow a socket path on its side. The mount-point check
+  of §2.1 needs `statfs`, which Node lacks; the fake checks the two devices
+  alone, as `VmManager` does.
+- **Fake agent** (`guest/internal/agenttest`, owned by WP-A). An in-process Go
+  implementation of §3.4 that WP-B can run on the Mac behind a unix socket to
+  check its splicing.
+- **Mock registry** (`src/main/docker/puller/test-registry.ts`, owned by WP-D).
+  An HTTP server with `/v2/`, token auth, manifests, blobs and a redirect host,
+  plus switches for digest corruption.
+- **Native forwarder** (`test/e2e/support/native-worker-docker.ts`, owned by
+  WP-E; owner decision 3). A `DockerBackend` whose workers forward to a
+  Linux runner's native `dockerd` (`/var/run/docker.sock`, or `DOCKER_HOST`
+  when that is a unix socket) and pull through it. `disposable` is false, so
+  a stopped socket removes what its job made. Only `test/e2e/docker.spec.ts`
+  imports it, and it drives it only off macOS; a jest test in
+  `docker-backend.test.ts` fails if any file under `src/` names it.
+- **The e2e spec's Mac mode** (`test/e2e/support/vm-worker-docker.ts`, owned
+  by WP-E). The real `VmBackend`, `DefaultVmManager`, `GuestImage` and
+  `VmImagePuller` (anonymous `RegistryClient`) over `build/localmost-vm`,
+  `build/guest` and `build/docker-cli/docker`, with two stand-ins: cache
+  disks that give every VM a blank data disk and never schedule a refresh,
+  and a worker proxy that accepts and drops connections. It first replaces
+  the cached `electron` module with `{ app: { isPackaged: false } }`, since
+  the puller reads `app.isPackaged` and the spec runs in plain Node.
+  It imports WP-D's puller and runs on WP-F's `build:native` output, and
+  `test/e2e` is outside `tsconfig.json`, so nothing checks it until it
+  runs. At integration, once D and F have merged: run `npm run
+  build:native`, then the spec on the Mac outside a job, which must pass
+  in full (10 of 10), and add a typecheck of `test/e2e` to
+  `npm run typecheck` (it cannot pass before D's modules exist), so that a
+  change to D's options or to `CacheDisks` fails CI rather than the next
+  manual run. When D's real `CacheDisks` replaces the stand-in in
+  `index.ts`, the blank one here and there can become one shared test
+  helper.

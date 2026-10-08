@@ -272,10 +272,11 @@ export class TargetManager {
       return { success: false, error: 'Target not found' };
     }
 
-    // Apply updates
+    // Only enabled is copied, whatever the caller's object carries: the
+    // rest of a stored target decides where registration tokens go.
     const updatedTarget: Target = {
       ...target,
-      ...updates,
+      ...(updates.enabled !== undefined ? { enabled: updates.enabled } : {}),
     };
 
     // Save to config

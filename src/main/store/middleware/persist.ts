@@ -13,6 +13,7 @@ import { bootLog } from '../../log-file';
 import { store, getState } from '../index';
 import { ConfigSlice, defaultConfigState } from '../types';
 import { AppConfig, CONFIG_VERSION, isConfigFromNewerBuild } from '../../config';
+import { resolveResourcePauseConfig } from '../../../shared/job-preferences';
 
 // Debounce timer for persistence
 let persistTimer: NodeJS.Timeout | null = null;
@@ -39,18 +40,74 @@ const PERSISTED_CONFIG_KEYS: (keyof ConfigSlice)[] = [
   'maxJobHistory',
   'sleepProtection',
   'sleepProtectionConsented',
-  'preserveWorkDir',
-  'toolCacheLocation',
   'userFilter',
   'sandboxPolicyLevel',
   'power',
   'notifications',
+  'resourcePause',
   'launchAtLogin',
   'hideOnStart',
   'runnerConfig',
   'targets',
   'maxConcurrentJobs',
 ];
+
+/**
+ * Who writes each key of config.yaml at a save:
+ *
+ * - `store`: the store, from its own value (PERSISTED_CONFIG_KEYS).
+ * - `file`: nobody; the file alone holds it, and this writer carries it
+ *   forward as written - the Docker VM sizes (read with resolveDockerVmConfig
+ *   at each worker spawn), the update check, and the OAuth client.
+ * - `auth`: the auth module, whose fields this writer copies forward.
+ * - `version`: this writer, stamping CONFIG_VERSION.
+ *
+ * Every key of AppConfig, and a key the store also holds can only be the
+ * store's, so a key added to AppConfig without saying who writes it fails to
+ * compile. dockerVm was added without telling this writer, and every save -
+ * on each config change, and at quit - rebuilt the file without it, dropping
+ * what was written there by hand. A key an earlier build wrote and AppConfig
+ * no longer has (preserveWorkDir, RETIRED_CONFIG_KEYS) still goes at the next
+ * save.
+ */
+const CONFIG_KEY_OWNER: {
+  readonly [K in keyof AppConfig]-?: K extends keyof ConfigSlice ? 'store' : 'file' | 'auth' | 'version';
+} = {
+  configVersion: 'version',
+  githubClientId: 'file',
+  auth: 'auth',
+  runnerConfig: 'store',
+  theme: 'store',
+  launchAtLogin: 'store',
+  hideOnStart: 'store',
+  sleepProtection: 'store',
+  logLevel: 'store',
+  runnerLogLevel: 'store',
+  userFilter: 'store',
+  updateSettings: 'file',
+  targets: 'store',
+  maxConcurrentJobs: 'store',
+  power: 'store',
+  notifications: 'store',
+  dockerVm: 'file',
+  resourcePause: 'store',
+};
+
+/**
+ * Sections of config.yaml an earlier build wrote that nothing reads now,
+ * each with why. A file that has one loads as usual, with one warning for
+ * it, and the next save leaves it out.
+ */
+export const RETIRED_CONFIG_KEYS: Readonly<Record<string, string>> = Object.freeze({
+  jobEnvironment: "the seatbelt job environment's conveniences are gone: every job runs in a macOS VM",
+  isolation: 'every job runs in a macOS VM, so there is no isolation type to allow',
+  toolCacheLocation: 'a macOS VM job keeps its tools in its own VM, which goes with the job',
+});
+
+/** The sections of config.yaml only the file holds, carried forward at each save (see CONFIG_KEY_OWNER). */
+const FILE_ONLY_CONFIG_KEYS = (Object.keys(CONFIG_KEY_OWNER) as Array<keyof AppConfig>).filter(
+  (key) => CONFIG_KEY_OWNER[key] === 'file'
+);
 
 /**
  * Load persisted config from YAML file into the store.
@@ -127,11 +184,6 @@ export function loadPersistedConfig(): void {
       configUpdates.sleepProtection = diskConfig.sleepProtection;
     }
 
-    // Preserve work dir
-    if (diskConfig.preserveWorkDir && ['never', 'always'].includes(diskConfig.preserveWorkDir)) {
-      configUpdates.preserveWorkDir = diskConfig.preserveWorkDir;
-    }
-
     // User filter - supports both old 'mode' format and new 'scope/allowedUsers' format
     if (diskConfig.userFilter) {
       const filter = diskConfig.userFilter;
@@ -180,6 +232,15 @@ export function loadPersistedConfig(): void {
         ...defaultConfigState.notifications,
         ...diskConfig.notifications,
       };
+    }
+
+    // What a resource pause does: as the runner reads it at each pause, so
+    // a value it would take as absent loads as the default it uses instead.
+    if (diskConfig.resourcePause !== undefined) {
+      configUpdates.resourcePause = resolveResourcePauseConfig(diskConfig.resourcePause, (message) => bootLog('warn', message));
+    }
+    for (const [key, why] of Object.entries(RETIRED_CONFIG_KEYS)) {
+      if ((diskConfig as Record<string, unknown>)[key] !== undefined) bootLog('warn', `Ignoring ${key} in config.yaml: ${why}`);
     }
 
     // Runner config
@@ -269,11 +330,15 @@ export function savePersistedConfig(): void {
     }
 
     // Preserve auth from existing config file (auth is saved separately by auth module)
-    // We must read and preserve it to avoid overwriting encrypted tokens
+    // We must read and preserve it to avoid overwriting encrypted tokens, and
+    // the sections only the file holds with it
     if (fs.existsSync(configPath)) {
       try {
         const existingContent = fs.readFileSync(configPath, 'utf-8');
         const existingConfig = (yaml.load(existingContent, { schema: yaml.JSON_SCHEMA }) as AppConfig) || {};
+        for (const key of FILE_ONLY_CONFIG_KEYS) {
+          if (existingConfig[key] !== undefined) configToSave[key] = existingConfig[key];
+        }
         // Copy forward only the fields we intend to persist. Copying the
         // section verbatim would keep a legacy accessToken/expiresAt written by
         // an older build on disk forever, which is exactly what
@@ -283,6 +348,11 @@ export function savePersistedConfig(): void {
           configToSave.auth = {
             refreshToken: existingAuth.refreshToken,
             user: existingAuth.user,
+            // Whether the session is spent is written by the auth module
+            // (saveConfig). This writer runs on every config change and on
+            // quit; rebuilding auth without it made every launch forget the
+            // session was dead and refresh a token that can never work.
+            ...(existingAuth.expired ? { expired: true } : {}),
           };
         }
       } catch (readErr) {

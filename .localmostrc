@@ -30,26 +30,10 @@ shared:
       - "registry.npmjs.org"
       - "nodejs.org"
   filesystem:
-    # Under strict the sandbox grants the OS, the runner's own directories and
-    # the workspace. Anything a build needs beyond that is declared here.
+    # A job's macOS VM supplies its own OS and toolchains. The npm cache is
+    # declared for when VM shares exist; until then a job is told it runs
+    # without it.
     write:
       - "~/.npm"
     read:
       - "~/.npm"
-      - "/etc"
-      - "/var"
-      - "/tmp"
-      - "/bin"
-      - "/sbin"
-      - "/usr/bin"
-      - "/usr/lib"
-      - "/usr/libexec"
-      - "/usr/sbin"
-      - "/usr/share"
-      - "/System"
-      - "/Library/Developer"
-      - "/Library/Preferences"
-      - "/private/etc"
-      - "/private/var/db"
-      - "/private/var/select"
-      - "/Applications/Xcode.app"

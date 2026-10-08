@@ -11,7 +11,6 @@ import {
   LogEntry,
   SleepProtection,
   LogLevel,
-  ToolCacheLocation,
   UserFilterConfig,
   PowerConfig,
   BatteryPauseThreshold,
@@ -20,8 +19,21 @@ import {
   DEFAULT_NOTIFICATIONS_CONFIG,
 } from '../../shared/types';
 import {
+  ResourcePauseConfig,
+  PreferenceSection,
+  DEFAULT_RESOURCE_PAUSE_CONFIG,
+  resolveResourcePauseConfig,
+} from '../../shared/job-preferences';
+import {
   useStore,
 } from '../store';
+
+// Fallback for a store that has no config yet, hoisted so every read returns
+// the same reference: useSyncExternalStore treats a fresh literal per read as
+// a change per read and re-renders until React throws "Maximum update depth
+// exceeded". The store is `{}` until main's first state arrives. (The old
+// inline literal was also the pre-normalization shape.)
+const NO_USER_FILTER: UserFilterConfig = { scope: 'everyone', allowedUsers: 'just-me', allowlist: [] };
 
 export type ThemeSetting = 'light' | 'dark' | 'auto';
 
@@ -50,12 +62,6 @@ interface AppConfigContextValue {
   sleepProtectionConsented: boolean;
   consentToSleepProtection: () => Promise<void>;
 
-  // Runner settings
-  preserveWorkDir: 'never' | 'session' | 'always';
-  setPreserveWorkDir: (setting: 'never' | 'session' | 'always') => Promise<void>;
-  toolCacheLocation: ToolCacheLocation;
-  setToolCacheLocation: (setting: ToolCacheLocation) => Promise<void>;
-
   // User filter
   userFilter: UserFilterConfig;
   setUserFilter: (filter: UserFilterConfig) => Promise<void>;
@@ -73,6 +79,10 @@ interface AppConfigContextValue {
   setNotifications: (config: NotificationsConfig) => Promise<void>;
   setNotifyOnPause: (enabled: boolean) => Promise<void>;
   setNotifyOnJobEvents: (enabled: boolean) => Promise<void>;
+
+  // What a resource pause does to running jobs
+  resourcePause: ResourcePauseConfig;
+  setResourcePauseRunningJobs: (runningJobs: ResourcePauseConfig['runningJobs']) => Promise<void>;
 
   // App state
   isOnline: boolean;
@@ -105,11 +115,10 @@ export const AppConfigProvider: React.FC<AppConfigProviderProps> = ({ children }
   const storeMaxJobHistory = useStore((state) => state?.config?.maxJobHistory ?? 10);
   const storeSleepProtection = useStore((state) => state?.config?.sleepProtection ?? 'never');
   const storeSleepProtectionConsented = useStore((state) => state?.config?.sleepProtectionConsented ?? false);
-  const storePreserveWorkDir = useStore((state) => state?.config?.preserveWorkDir ?? 'never');
-  const storeToolCacheLocation = useStore((state) => state?.config?.toolCacheLocation ?? 'persistent');
-  const storeUserFilter = useStore((state) => state?.config?.userFilter ?? { mode: 'just-me' as const, allowlist: [] });
+  const storeUserFilter = useStore((state) => state?.config?.userFilter ?? NO_USER_FILTER);
   const storePower = useStore((state) => state?.config?.power ?? DEFAULT_POWER_CONFIG);
   const storeNotifications = useStore((state) => state?.config?.notifications ?? DEFAULT_NOTIFICATIONS_CONFIG);
+  const storeResourcePause = useStore((state) => state?.config?.resourcePause ?? DEFAULT_RESOURCE_PAUSE_CONFIG);
   const storeIsOnline = useStore((state) => state?.ui?.isOnline ?? true);
   const storeIsLoading = useStore((state) => state?.ui?.isInitialLoading ?? true);
   const storeError = useStore((state) => state?.ui?.error ?? null);
@@ -133,11 +142,10 @@ export const AppConfigProvider: React.FC<AppConfigProviderProps> = ({ children }
     maxJobHistory: number;
     sleepProtection: SleepProtection;
     sleepProtectionConsented: boolean;
-    preserveWorkDir: 'never' | 'session' | 'always';
-    toolCacheLocation: ToolCacheLocation;
     userFilter: UserFilterConfig;
     power: PowerConfig;
     notifications: NotificationsConfig;
+    resourcePause: ResourcePauseConfig;
     isOnline: boolean;
     isLoading: boolean;
     error: string | null;
@@ -149,11 +157,10 @@ export const AppConfigProvider: React.FC<AppConfigProviderProps> = ({ children }
     maxJobHistory: 10,
     sleepProtection: 'never',
     sleepProtectionConsented: false,
-    preserveWorkDir: 'never',
-    toolCacheLocation: 'persistent',
     userFilter: { scope: 'everyone', allowedUsers: 'just-me', allowlist: [] },
     power: DEFAULT_POWER_CONFIG,
     notifications: DEFAULT_NOTIFICATIONS_CONFIG,
+    resourcePause: DEFAULT_RESOURCE_PAUSE_CONFIG,
     isOnline: true,
     isLoading: true,
     error: null,
@@ -167,11 +174,10 @@ export const AppConfigProvider: React.FC<AppConfigProviderProps> = ({ children }
   const maxJobHistory = isZubridgeReady ? storeMaxJobHistory : fallbackState.maxJobHistory;
   const sleepProtection = isZubridgeReady ? storeSleepProtection : fallbackState.sleepProtection;
   const sleepProtectionConsented = isZubridgeReady ? storeSleepProtectionConsented : fallbackState.sleepProtectionConsented;
-  const preserveWorkDir = isZubridgeReady ? storePreserveWorkDir : fallbackState.preserveWorkDir;
-  const toolCacheLocation = isZubridgeReady ? storeToolCacheLocation : fallbackState.toolCacheLocation;
   const userFilter = isZubridgeReady ? storeUserFilter : fallbackState.userFilter;
   const power = isZubridgeReady ? storePower : fallbackState.power;
   const notifications = isZubridgeReady ? storeNotifications : fallbackState.notifications;
+  const resourcePause = isZubridgeReady ? storeResourcePause : fallbackState.resourcePause;
   const isOnline = isZubridgeReady ? storeIsOnline : fallbackState.isOnline;
   const isLoading = isZubridgeReady ? storeIsLoading : fallbackState.isLoading;
   const error = isZubridgeReady ? storeError : fallbackState.error;
@@ -221,8 +227,6 @@ export const AppConfigProvider: React.FC<AppConfigProviderProps> = ({ children }
             typeof settings.sleepProtectionConsented === 'boolean'
               ? settings.sleepProtectionConsented
               : prev.sleepProtectionConsented,
-          preserveWorkDir: (settings.preserveWorkDir as 'never' | 'session' | 'always') || prev.preserveWorkDir,
-          toolCacheLocation: (settings.toolCacheLocation as ToolCacheLocation) || prev.toolCacheLocation,
           // Normalize rather than accepting only the new shape: a config still
           // using the legacy `mode` field would otherwise be discarded here and
           // silently replaced by the default, so the UI would show a policy
@@ -232,6 +236,9 @@ export const AppConfigProvider: React.FC<AppConfigProviderProps> = ({ children }
             : prev.userFilter,
           power: settings.power ? { ...DEFAULT_POWER_CONFIG, ...(settings.power as PowerConfig) } : prev.power,
           notifications: settings.notifications ? { ...DEFAULT_NOTIFICATIONS_CONFIG, ...(settings.notifications as NotificationsConfig) } : prev.notifications,
+          // Read as the runner reads config.yaml, so a value it would take as
+          // absent shows as the default it uses instead.
+          resourcePause: resolveResourcePauseConfig(settings.resourcePause as PreferenceSection<ResourcePauseConfig> | undefined),
           isLoading: false,
         }));
 
@@ -344,24 +351,6 @@ export const AppConfigProvider: React.FC<AppConfigProviderProps> = ({ children }
     }
   }, []);
 
-  const setPreserveWorkDir = useCallback(async (setting: 'never' | 'session' | 'always') => {
-    setFallbackState(prev => ({ ...prev, preserveWorkDir: setting }));
-    try {
-      await window.localmost.settings.set({ preserveWorkDir: setting });
-    } catch {
-      // Optimistic update handled by zubridge sync
-    }
-  }, []);
-
-  const setToolCacheLocation = useCallback(async (setting: ToolCacheLocation) => {
-    setFallbackState(prev => ({ ...prev, toolCacheLocation: setting }));
-    try {
-      await window.localmost.settings.set({ toolCacheLocation: setting });
-    } catch {
-      // Optimistic update handled by zubridge sync
-    }
-  }, []);
-
   const setUserFilter = useCallback(async (filter: UserFilterConfig) => {
     setFallbackState(prev => ({ ...prev, userFilter: filter }));
     try {
@@ -430,6 +419,16 @@ export const AppConfigProvider: React.FC<AppConfigProviderProps> = ({ children }
     }
   }, [notifications]);
 
+  const setResourcePauseRunningJobs = useCallback(async (runningJobs: ResourcePauseConfig['runningJobs']) => {
+    const newConfig = { ...resourcePause, runningJobs };
+    setFallbackState(prev => ({ ...prev, resourcePause: newConfig }));
+    try {
+      await window.localmost.settings.set({ resourcePause: newConfig });
+    } catch {
+      // Optimistic update handled by zubridge sync
+    }
+  }, [resourcePause]);
+
   const clearLogs = useCallback(() => {
     logsRef.current = [];
     setLogs([]);
@@ -453,10 +452,6 @@ export const AppConfigProvider: React.FC<AppConfigProviderProps> = ({ children }
     setSleepProtection,
     sleepProtectionConsented,
     consentToSleepProtection,
-    preserveWorkDir,
-    setPreserveWorkDir,
-    toolCacheLocation,
-    setToolCacheLocation,
     userFilter,
     setUserFilter,
     power,
@@ -467,6 +462,8 @@ export const AppConfigProvider: React.FC<AppConfigProviderProps> = ({ children }
     setNotifications,
     setNotifyOnPause,
     setNotifyOnJobEvents,
+    resourcePause,
+    setResourcePauseRunningJobs,
     isOnline,
     isLoading,
     error,

@@ -415,3 +415,15 @@
   color: var(--accent);
   background: var(--bg-tertiary);
 }
+
+/* A stored session the app can no longer use. Sits beside the account it
+   belongs to, so the state is read where the account is read. */
+.expiredNotice {
+  font-size: 12px;
+  font-weight: 600;
+  color: var(--warning, #d97706);
+  padding: 2px 8px;
+  border: 1px solid var(--warning, #d97706);
+  border-radius: 4px;
+  white-space: nowrap;
+}

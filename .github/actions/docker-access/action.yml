@@ -15,9 +15,12 @@ runs:
 
         if ! docker version --format 'client {{.Client.Version}} / server {{.Server.Version}}'; then
           echo "::error::No reachable Docker daemon."
-          echo "On the localmost runner this means the repository's docker policy was"
-          echo "not approved or not bound to the job's socket, or Docker Desktop is"
-          echo "not running on the host."
+          echo "On the localmost runner every job is served a docker socket, which answers"
+          echo "this step itself until the job's Docker VM is ready. So this step fails there"
+          echo "only when that socket cannot answer even that: the app's Docker VM guest is"
+          echo "missing or unreadable (the reason is in the error above), or DOCKER_HOST"
+          echo "names no socket. A docker policy that was not approved passes this step and"
+          echo "is refused in the next one."
           exit 1
         fi
 
@@ -27,7 +30,9 @@ runs:
         set -euo pipefail
         # The pull and the run both go through the filtering socket localmost
         # serves the job, which checks the registry (pull.registries) and the
-        # image (run.images) against the repository's docker policy.
+        # image (run.images) against the repository's docker policy. On the
+        # localmost runner the image is pulled on the Mac and loaded into the
+        # job's own Docker VM, where the container runs.
         docker run --rm alpine:3 echo "container ran"
 
     - name: Check credentials never enter the sandbox
@@ -44,4 +49,4 @@ runs:
           echo "::error::~/.docker/config.json was readable; registry credentials must never enter the sandbox"
           exit 1
         fi
-        echo "config.json is denied: credentials are attached by the filtering socket, never read by the job"
+        echo "config.json is denied: pulls are made on the Mac, and credentials never reach the job or its VM"

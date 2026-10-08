@@ -90,7 +90,9 @@ describe('UserFilterSettings', () => {
         />
       );
 
-      expect(screen.getByText(/Check who triggered the workflow/)).toBeInTheDocument();
+      // The trigger is github.actor, not the code's author: a maintainer who
+      // updates a fork's pull request runs its code as themselves.
+      expect(screen.getByText('Checks who triggered the workflow (github.actor), not who wrote the code it runs.')).toBeInTheDocument();
 
       rerender(
         <UserFilterSettings
@@ -100,7 +102,12 @@ describe('UserFilterSettings', () => {
         />
       );
 
-      expect(screen.getByText(/Check all contributors to the repository/)).toBeInTheDocument();
+      expect(screen.getByText(/who triggered the workflow and all contributors to the repository/)).toBeInTheDocument();
+      // An author GitHub links to no account can be anyone, so the scope
+      // refuses the repository outright - say so before it surprises anyone.
+      expect(
+        screen.getByText(/any commit author not linked to a GitHub account is refused.*no allowlist can admit/)
+      ).toBeInTheDocument();
     });
   });
 

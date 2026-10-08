@@ -3,8 +3,8 @@
  * localmost CLI
  *
  * Commands:
- *   localmost test    - Run workflows locally (standalone, no app required)
- *   localmost policy  - Manage sandbox policies
+ *   localmost test    - Run workflows locally, in a macOS VM the app starts
+ *   localmost policy  - Manage .localmostrc policies
  *   localmost env     - Show environment information
  *   localmost start   - Start the localmost app
  *   localmost stop    - Stop the localmost app
@@ -16,13 +16,16 @@
 
 import * as net from 'net';
 import * as fs from 'fs';
+import { isSocketLive } from './app-running';
 import * as path from 'path';
 import { spawn } from 'child_process';
 import { getCliSocketPath } from '../shared/paths';
+import { formatStatus, getStatusIcon } from './status';
 import { runTest, parseTestArgs, printTestHelp } from './test';
 import { runPolicy, parsePolicyArgs, printPolicyHelp } from './policy';
 import { runEnv, parseEnvArgs, printEnvHelp } from './env';
 import { runTargets, parseTargetsArgs, printTargetsHelp, createPrompt } from './targets';
+import { runImage, parseImageArgs, printImageHelp } from './image';
 
 import type {
   CliRequest,
@@ -32,6 +35,13 @@ import type {
   ActionResponse,
 } from '../shared/cli-protocol';
 
+// Everything the CLI writes - approved policies, workspace copies, the
+// action cache - is the user's alone, as it is for the app, which sets the
+// same mask. A shell's usual 022 would leave it readable by every account on
+// the machine. The workspace copy `localmost test` sends into its macOS VM is
+// made under it too.
+process.umask(0o077);
+
 const HELP_TEXT = `
 localmost - Run GitHub Actions locally
 
@@ -39,18 +49,19 @@ USAGE:
   localmost <command> [options]
 
 STANDALONE COMMANDS (no app required):
-  test      Run workflows locally before pushing
-  policy    Manage .localmostrc sandbox policies
+  policy    Manage .localmostrc policies
   env       Show environment information
 
 APP COMMANDS (requires running app):
+  test      Run workflows locally before pushing, in a macOS VM
   start     Start the localmost app
   stop      Stop the localmost app
   status    Show current runner status
-  pause     Pause the runner (stops accepting jobs)
+  pause     Pause the runner (takes no new jobs; running jobs finish)
   resume    Resume the runner (start accepting jobs)
   jobs      Show recent job history
   targets   Manage the repos/orgs this machine runs jobs for
+  image     Build and watch the golden macOS VM image (status/build/cancel)
 
 EXAMPLES:
   localmost test                  Run default workflow locally
@@ -61,12 +72,14 @@ EXAMPLES:
   localmost status                Check runner status
   localmost targets               List configured targets
   localmost targets add o/r       Register runners for a repo
+  localmost image build           Build the golden macOS VM image
 
 For command-specific help:
   localmost test --help
   localmost policy --help
   localmost env --help
   localmost targets --help
+  localmost image --help
 
 DOCUMENTATION:
   https://github.com/bfulton/localmost
@@ -95,69 +108,10 @@ function formatTimestamp(isoString: string): string {
   return date.toLocaleString();
 }
 
-function getStatusIcon(status: string): string {
-  switch (status) {
-    case 'listening': return '\u2713'; // checkmark
-    case 'busy': return '\u25CF';    // filled circle
-    case 'starting': return '\u25CB'; // empty circle
-    case 'offline': return '\u25CB'; // empty circle
-    case 'shutting_down': return '\u25CB'; // empty circle
-    case 'error': return '\u2717';   // x mark
-    case 'completed': return '\u2713';
-    case 'failed': return '\u2717';
-    case 'cancelled': return '-';
-    default: return '?';
-  }
-}
-
 function printStatus(response: StatusResponse): void {
-  const { runner, runnerName, heartbeat, authenticated, userName, resourcePause } = response.data;
-
-  console.log();
-
-  // GitHub status (matches Status Page order)
-  if (authenticated) {
-    console.log(`GitHub:    Connected as @${userName || 'unknown'}`);
-  } else {
-    console.log(`GitHub:    Not connected`);
+  for (const line of formatStatus(response.data)) {
+    console.log(line);
   }
-
-  // Runner status
-  let runnerStatusText: string;
-  let runnerIcon: string;
-
-  if (resourcePause?.isPaused) {
-    runnerIcon = '\u23F8'; // pause symbol
-    runnerStatusText = `Paused (${resourcePause.reason || 'resource constraint'})`;
-  } else {
-    runnerIcon = getStatusIcon(runner.status);
-    // Capitalize status to match UI
-    const statusMap: Record<string, string> = {
-      'offline': 'Offline',
-      'starting': 'Starting',
-      'listening': 'Listening',
-      'busy': 'Running job',
-      'error': 'Error',
-      'shutting_down': 'Shutting down',
-    };
-    runnerStatusText = statusMap[runner.status] || runner.status;
-  }
-
-  console.log(`Runner:    ${runnerIcon} ${runnerStatusText}`);
-  console.log(`           ${runnerName}`);
-
-  // Job status
-  if (runner.status === 'busy' && runner.jobName) {
-    console.log(`Job:       Running`);
-    console.log(`           ${runner.jobName}`);
-  } else {
-    console.log(`Job:       Inactive`);
-  }
-
-  // Heartbeat status
-  console.log(`Heartbeat: ${heartbeat.isRunning ? 'Active' : 'Inactive'}`);
-
-  console.log();
 }
 
 function printJobs(response: JobsResponse): void {
@@ -244,10 +198,14 @@ async function sendCommand(
 
 /**
  * Check if the app is running by testing socket connection.
+ *
+ * It used to check only that the socket file existed, which a force quit
+ * leaves behind - so `localmost start` reported "already running" forever
+ * afterwards with nothing running, and the only way out was knowing to delete
+ * the file. isSocketLive connects, and clears the file when nothing answers.
  */
-function isAppRunning(): boolean {
-  const socketPath = getCliSocketPath();
-  return fs.existsSync(socketPath);
+async function isAppRunning(): Promise<boolean> {
+  return isSocketLive(getCliSocketPath());
 }
 
 /**
@@ -318,7 +276,7 @@ function getDevCheckoutRoot(): string | null {
  * Start the localmost app.
  */
 async function startApp(): Promise<void> {
-  if (isAppRunning()) {
+  if (await isAppRunning()) {
     console.log('localmost is already running');
     return;
   }
@@ -369,7 +327,7 @@ async function startApp(): Promise<void> {
     await new Promise((resolve) => setTimeout(resolve, checkInterval));
     waited += checkInterval;
 
-    if (isAppRunning()) {
+    if (await isAppRunning()) {
       console.log('localmost started successfully');
       return;
     }
@@ -382,7 +340,7 @@ async function startApp(): Promise<void> {
  * Stop the localmost app.
  */
 async function stopApp(): Promise<void> {
-  if (!isAppRunning()) {
+  if (!await isAppRunning()) {
     console.log('localmost is not running');
     return;
   }
@@ -414,7 +372,8 @@ async function main(): Promise<void> {
   const subArgs = args.slice(1);
 
   // =========================================================================
-  // STANDALONE COMMANDS (no app required)
+  // STANDALONE COMMANDS (no app required), and test, which asks the app for
+  // its macOS VM itself
   // =========================================================================
 
   // Test command - run workflows locally
@@ -508,7 +467,7 @@ async function main(): Promise<void> {
       process.exit(1);
     }
 
-    if (!isAppRunning()) {
+    if (!await isAppRunning()) {
       console.error('Error: localmost app is not running (start it with "localmost start")');
       process.exit(1);
     }
@@ -522,13 +481,44 @@ async function main(): Promise<void> {
     process.exit(exitCode);
   }
 
+  // Image command - build and watch the golden macOS VM image
+  if (command === 'image') {
+    if (subArgs.includes('--help') || subArgs.includes('-h')) {
+      printImageHelp();
+      process.exit(0);
+    }
+
+    let parsed;
+    try {
+      parsed = parseImageArgs(subArgs);
+    } catch (err) {
+      console.error(`Error: ${(err as Error).message}`);
+      console.error('Run "localmost image --help" for usage information.');
+      process.exit(1);
+    }
+
+    if (!await isAppRunning()) {
+      console.error('Error: localmost app is not running (start it with "localmost start")');
+      process.exit(1);
+    }
+
+    // A build streams for as long as it runs, so it manages its own
+    // connection and timeout; status and cancel answer at once.
+    const exitCode = await runImage(parsed.subcommand, parsed.options, {
+      send: request => sendCommand(request),
+      out: line => console.log(line),
+      err: line => console.error(line),
+    });
+    process.exit(exitCode);
+  }
+
   if (!['status', 'pause', 'resume', 'jobs'].includes(command)) {
     console.error(`Unknown command: ${command}`);
     console.error('Run "localmost help" for usage information.');
     process.exit(1);
   }
 
-  if (!isAppRunning()) {
+  if (!await isAppRunning()) {
     console.log('localmost app is not running');
     process.exit(0);
   }

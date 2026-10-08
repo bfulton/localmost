@@ -4,13 +4,35 @@
  */
 
 import { app, dialog } from 'electron';
-import { exec } from 'child_process';
+import { execFile } from 'child_process';
 import { promisify } from 'util';
 import * as fs from 'fs/promises';
 import * as path from 'path';
 import { getMainWindow } from './app-state';
 
-const execAsync = promisify(exec);
+const execFileAsync = promisify(execFile);
+
+/**
+ * Run a shell command as root through osascript's administrator prompt.
+ *
+ * The command is fixed, and any paths it works on are passed to it as
+ * arguments: AppleScript's `quoted form of` quotes each one for the shell.
+ * The bundle's path is wherever the user put the app, and spliced into the
+ * script it was code - a quote in a folder name ended the string, and what
+ * followed ran as root.
+ */
+function runAsAdministrator(command: string, args: string[]): Promise<unknown> {
+  const quotedArgs = args.map((_, i) => ` & " " & quoted form of (item ${i + 1} of argv)`).join('');
+  return execFileAsync('/usr/bin/osascript', [
+    '-e',
+    'on run argv',
+    '-e',
+    `do shell script "${command}"${quotedArgs} with administrator privileges`,
+    '-e',
+    'end run',
+    ...args,
+  ]);
+}
 
 /** Target path for the CLI symlink */
 const CLI_INSTALL_PATH = '/usr/local/bin/localmost';
@@ -102,15 +124,11 @@ export async function installCli(): Promise<{ success: boolean; error?: string }
     return { success: true };
   }
 
-  // Build the shell command
-  // mkdir -p ensures /usr/local/bin exists; ln -sf overwrites any existing symlink
-  const shellCommand = `mkdir -p /usr/local/bin && ln -sf '${sourcePath}' '${CLI_INSTALL_PATH}'`;
-
-  // Use osascript to run with administrator privileges (triggers macOS password prompt)
-  const script = `do shell script "${shellCommand}" with administrator privileges`;
-
   try {
-    await execAsync(`osascript -e '${script}'`);
+    // mkdir -p ensures /usr/local/bin exists; ln -sfh replaces any existing
+    // link rather than following one that leads to a directory. osascript
+    // runs it with administrator privileges (triggers macOS password prompt).
+    await runAsAdministrator('mkdir -p /usr/local/bin && ln -sfh', [sourcePath, CLI_INSTALL_PATH]);
 
     dialog.showMessageBox(mainWindow!, {
       type: 'info',
@@ -177,10 +195,8 @@ export async function uninstallCli(): Promise<{ success: boolean; error?: string
   }
 
   // Use osascript to remove with administrator privileges
-  const script = `do shell script "rm -f '${CLI_INSTALL_PATH}'" with administrator privileges`;
-
   try {
-    await execAsync(`osascript -e '${script}'`);
+    await runAsAdministrator('rm -f', [CLI_INSTALL_PATH]);
 
     dialog.showMessageBox(mainWindow!, {
       type: 'info',

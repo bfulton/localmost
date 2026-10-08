@@ -12,6 +12,7 @@ export interface MockLocalmost {
     startDeviceFlow: jest.Mock;
     cancelAuth: jest.Mock;
     logout: jest.Mock;
+    reconnect: jest.Mock;
     getRepos: jest.Mock;
     getOrgs: jest.Mock;
     onDeviceCode: jest.Mock;
@@ -50,6 +51,7 @@ export interface MockLocalmost {
   };
   app: {
     getHostname: jest.Mock;
+    onNavigate: (cb: (view: string) => void) => () => void;
     minimize: jest.Mock;
     quit: jest.Mock;
   };
@@ -75,6 +77,14 @@ export interface MockLocalmost {
     getState: jest.Mock;
     onStateChange: jest.Mock;
   };
+  macosVm: {
+    getStatus: jest.Mock;
+    build: jest.Mock;
+    cancel: jest.Mock;
+    openGuidedSetup: jest.Mock;
+    remove: jest.Mock;
+    onStatusChange: jest.Mock;
+  };
 }
 
 // Extend Window interface for tests
@@ -96,6 +106,7 @@ const mockLocalmost: MockLocalmost = {
     startDeviceFlow: jest.fn(),
     cancelAuth: jest.fn(),
     logout: jest.fn(),
+    reconnect: jest.fn(),
     getRepos: jest.fn().mockResolvedValue({ success: true, repos: [] }),
     getOrgs: jest.fn().mockResolvedValue({ success: true, orgs: [] }),
     onDeviceCode: jest.fn().mockReturnValue(() => {}),
@@ -134,6 +145,7 @@ const mockLocalmost: MockLocalmost = {
   },
   app: {
     getHostname: jest.fn().mockResolvedValue('test-host'),
+    onNavigate: (_cb: (view: string) => void) => () => undefined,
     minimize: jest.fn(),
     quit: jest.fn(),
   },
@@ -158,6 +170,14 @@ const mockLocalmost: MockLocalmost = {
   resource: {
     getState: jest.fn().mockResolvedValue({ isPaused: false, reason: null, conditions: [] }),
     onStateChange: jest.fn().mockReturnValue(() => {}),
+  },
+  macosVm: {
+    getStatus: jest.fn().mockResolvedValue({ state: 'not-built', disk: { freeBytes: 0, neededBytes: 0 }, provisioning: 'guided', busy: false }),
+    build: jest.fn().mockResolvedValue({ success: true }),
+    cancel: jest.fn().mockResolvedValue({ success: true }),
+    openGuidedSetup: jest.fn().mockResolvedValue({ success: true }),
+    remove: jest.fn().mockResolvedValue({ success: true }),
+    onStatusChange: jest.fn().mockReturnValue(() => {}),
   },
 };
 

@@ -22,6 +22,7 @@ import {
   ResourcePauseState,
   PolicySummary,
 } from '../shared/types';
+import { MACOS_VM_CHANNELS, type MacVmSetupApi, type MacVmSetupStatus } from '../shared/macos-vm-setup';
 
 // Initialize zubridge preload handlers
 const { handlers: zubridgeHandlers } = preloadBridge();
@@ -52,6 +53,7 @@ contextBridge.exposeInMainWorld('localmost', {
     cancelAuth: () => ipcRenderer.invoke(IPC_CHANNELS.GITHUB_AUTH_CANCEL),
     getAuthStatus: () => ipcRenderer.invoke(IPC_CHANNELS.GITHUB_AUTH_STATUS),
     logout: () => ipcRenderer.invoke(IPC_CHANNELS.GITHUB_AUTH_LOGOUT),
+    reconnect: () => ipcRenderer.invoke(IPC_CHANNELS.GITHUB_AUTH_RECONNECT),
     getRepos: () => ipcRenderer.invoke(IPC_CHANNELS.GITHUB_GET_REPOS),
     getOrgs: () => ipcRenderer.invoke(IPC_CHANNELS.GITHUB_GET_ORGS),
     searchUsers: (query: string) => ipcRenderer.invoke(IPC_CHANNELS.GITHUB_SEARCH_USERS, query),
@@ -149,7 +151,8 @@ contextBridge.exposeInMainWorld('localmost', {
   // Targets (multi-target runner support)
   policy: {
     list: () => ipcRenderer.invoke(IPC_CHANNELS.POLICY_LIST),
-    approve: (repository: string) => ipcRenderer.invoke(IPC_CHANNELS.POLICY_APPROVE, repository),
+    approve: (repository: string, stamp: string) =>
+      ipcRenderer.invoke(IPC_CHANNELS.POLICY_APPROVE, repository, stamp),
     reject: (repository: string) => ipcRenderer.invoke(IPC_CHANNELS.POLICY_REJECT, repository),
   },
 
@@ -177,6 +180,20 @@ contextBridge.exposeInMainWorld('localmost', {
       return () => ipcRenderer.removeListener(IPC_CHANNELS.RESOURCE_STATE_CHANGED, handler);
     },
   },
+
+  // The macOS VM mode's golden image (src/renderer/components/MacVmSetup.tsx)
+  macosVm: {
+    getStatus: () => ipcRenderer.invoke(MACOS_VM_CHANNELS.GET_STATUS),
+    build: () => ipcRenderer.invoke(MACOS_VM_CHANNELS.BUILD),
+    cancel: () => ipcRenderer.invoke(MACOS_VM_CHANNELS.CANCEL),
+    openGuidedSetup: () => ipcRenderer.invoke(MACOS_VM_CHANNELS.OPEN_GUIDED_SETUP),
+    remove: () => ipcRenderer.invoke(MACOS_VM_CHANNELS.REMOVE),
+    onStatusChange: (callback: (status: MacVmSetupStatus) => void) => {
+      const handler = (_event: Electron.IpcRendererEvent, status: MacVmSetupStatus) => callback(status);
+      ipcRenderer.on(MACOS_VM_CHANNELS.STATUS_CHANGED, handler);
+      return () => ipcRenderer.removeListener(MACOS_VM_CHANNELS.STATUS_CHANGED, handler);
+    },
+  },
 });
 
 // Type declarations for the exposed API
@@ -193,8 +210,10 @@ export interface LocalmostAPI {
     startAuth: () => Promise<{ success: boolean; user?: GitHubUser; error?: string }>;
     startDeviceFlow: () => Promise<{ success: boolean; user?: GitHubUser; error?: string }>;
     cancelAuth: () => Promise<{ success: boolean }>;
-    getAuthStatus: () => Promise<{ isAuthenticated: boolean; user?: GitHubUser }>;
+    getAuthStatus: () => Promise<{ isAuthenticated: boolean; expired?: boolean; user?: GitHubUser }>;
     logout: () => Promise<{ success: boolean }>;
+    /** Try to recover an expired session; false means the device flow is needed. */
+    reconnect: () => Promise<{ recovered: boolean }>;
     getRepos: () => Promise<{ success: boolean; repos?: GitHubRepo[]; error?: string }>;
     getOrgs: () => Promise<{ success: boolean; orgs?: GitHubOrg[]; error?: string }>;
     searchUsers: (query: string) => Promise<{ success: boolean; users?: GitHubUserSearchResult[]; error?: string }>;
@@ -247,7 +266,7 @@ export interface LocalmostAPI {
   };
   policy: {
     list: () => Promise<PolicySummary[]>;
-    approve: (repository: string) => Promise<Result>;
+    approve: (repository: string, stamp: string) => Promise<Result>;
     reject: (repository: string) => Promise<Result>;
   };
   targets: {
@@ -262,6 +281,7 @@ export interface LocalmostAPI {
     getState: () => Promise<ResourcePauseState>;
     onStateChange: (callback: (state: ResourcePauseState) => void) => () => void;
   };
+  macosVm: MacVmSetupApi;
 }
 
 declare global {

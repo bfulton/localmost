@@ -3,7 +3,7 @@
 Theme: Shift left on both feedback and security. Catch workflow problems before pushing, and enforce least-privilege sandboxing by default.
 
 **Status:** the four success criteria below are met. Remaining unchecked items are
-secrets-in-Keychain, an in-app approval UI, `--updaterc` interactivity, and
+secrets-in-Keychain, an in-app approval UI, a full `--updaterc` diff, and
 Homebrew packaging — each marked inline. `strict` is the shipped default.
 
 ## Features
@@ -51,8 +51,8 @@ The test command must work without the Electron app.
   - [x] Action fetcher and cache
 - [x] Create `src/cli/test.ts` command structure
 - [x] Implement working tree snapshot
-  - [x] Fast copy via hard links (`cp -al`) with fallback to rsync
-  - [x] Respect `.gitignore` by default, `--no-ignore` flag to include all
+  - [x] Fast private copy via APFS clones, never hard links, with a byte-copy fallback
+  - [x] Respect `.gitignore` by default (the file list from git), `--no-ignore` flag to include all
   - [x] Create temp workspace in `~/.localmost/workspaces/`
 - [x] Add cleanup of old workspaces (keep last N, or age-based)
 
@@ -119,8 +119,8 @@ Run workflow steps in the sandbox.
 - [x] Hook sandbox to log all access attempts (network, filesystem)
 - [x] Run workflow in permissive mode while recording
 - [x] Deduplicate and categorize access (by step, by type)
-- [ ] Interactive prompt to write/update `.localmostrc` — **not built**; `--updaterc` writes directly
-- [ ] Diff display when updating existing file — **not built** for `--updaterc` (`localmost policy diff` does show one)
+- [x] Interactive prompt to write/update `.localmostrc` — `--updaterc` names the file it will write and lists each addition, then asks (`--yes` skips the question)
+- [ ] Diff display when updating existing file — **partial** for `--updaterc`: it lists what it adds, not the comments and formatting its rewrite drops (`localmost policy diff` does show one)
 - [x] `--dry-run` to show what would be recorded without writing
 
 ### Phase 7: Enforcement Mode

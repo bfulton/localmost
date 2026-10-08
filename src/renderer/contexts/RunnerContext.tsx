@@ -8,6 +8,24 @@
 import React, { createContext, useContext, useState, useEffect, useCallback, ReactNode } from 'react';
 import { GitHubUser, GitHubRepo, GitHubOrg, RunnerState, JobHistoryEntry, DownloadProgress, DeviceCodeInfo, RunnerRelease, Target, RunnerProxyStatus } from '../../shared/types';
 import { useStore } from '../store';
+import type { AppState } from '../../main/store/types';
+
+// Fallbacks for slices the store does not hold yet, hoisted so each read
+// returns the same reference. The selectors below feed useSyncExternalStore,
+// which compares snapshots by identity: a fresh `[]` on every read is a change
+// on every read, and React re-renders synchronously until it gives up with
+// "Maximum update depth exceeded" and the ErrorBoundary replaces the app. The
+// store is `{}` until main's first state arrives, which is exactly when these
+// are read - so the crash showed only when main was slow enough to lose that
+// race, as a launch whose titlebar never appeared.
+const NO_REPOS: GitHubRepo[] = [];
+const NO_ORGS: GitHubOrg[] = [];
+const NO_VERSIONS: RunnerRelease[] = [];
+const NO_TARGETS: Target[] = [];
+const NO_TARGET_STATUS: RunnerProxyStatus[] = [];
+const NO_HISTORY: JobHistoryEntry[] = [];
+const NO_RUNNER_VERSION: AppState['runner']['runnerVersion'] = { version: null, url: null };
+const OFFLINE: AppState['runner']['runnerState'] = { status: 'offline' };
 
 interface RunnerConfig {
   level: 'repo' | 'org';
@@ -21,6 +39,10 @@ interface RunnerConfig {
 interface RunnerContextValue {
   // Auth state
   user: GitHubUser | null;
+  /** The session is stored but unusable: its refresh token is spent. */
+  authExpired: boolean;
+  /** Re-read that flag, for a UI that just tried to fix it. */
+  refreshAuthExpiry: () => Promise<void>;
   isAuthenticating: boolean;
   deviceCode: DeviceCodeInfo | null;
   login: () => Promise<void>;
@@ -89,21 +111,21 @@ export const RunnerProvider: React.FC<RunnerProviderProps> = ({ children }) => {
   const storeUser = useStore((state) => state?.auth?.user ?? null);
   const storeIsAuthenticating = useStore((state) => state?.auth?.isAuthenticating ?? false);
   const storeDeviceCode = useStore((state) => state?.auth?.deviceCode ?? null);
-  const storeRepos = useStore((state) => state?.github?.repos ?? []);
-  const storeOrgs = useStore((state) => state?.github?.orgs ?? []);
+  const storeRepos = useStore((state) => state?.github?.repos ?? NO_REPOS);
+  const storeOrgs = useStore((state) => state?.github?.orgs ?? NO_ORGS);
   const storeIsDownloaded = useStore((state) => state?.runner?.isDownloaded ?? false);
-  const storeRunnerVersion = useStore((state) => state?.runner?.runnerVersion ?? { version: null, url: null });
-  const storeAvailableVersions = useStore((state) => state?.runner?.availableVersions ?? []);
+  const storeRunnerVersion = useStore((state) => state?.runner?.runnerVersion ?? NO_RUNNER_VERSION);
+  const storeAvailableVersions = useStore((state) => state?.runner?.availableVersions ?? NO_VERSIONS);
   const storeSelectedVersion = useStore((state) => state?.runner?.selectedVersion ?? '');
   const storeDownloadProgress = useStore((state) => state?.runner?.downloadProgress ?? null);
   const storeIsLoadingVersions = useStore((state) => state?.runner?.isLoadingVersions ?? false);
   const storeIsConfigured = useStore((state) => state?.runner?.isConfigured ?? false);
   const storeRunnerConfig = useStore((state) => state?.config?.runnerConfig ?? defaultRunnerConfig);
   const storeRunnerDisplayName = useStore((state) => state?.runner?.runnerDisplayName ?? null);
-  const storeTargets = useStore((state) => state?.config?.targets ?? []);
-  const storeTargetStatus = useStore((state) => state?.runner?.targetStatus ?? []);
-  const storeRunnerState = useStore((state) => state?.runner?.runnerState ?? { status: 'offline' });
-  const storeJobHistory = useStore((state) => state?.jobs?.history ?? []);
+  const storeTargets = useStore((state) => state?.config?.targets ?? NO_TARGETS);
+  const storeTargetStatus = useStore((state) => state?.runner?.targetStatus ?? NO_TARGET_STATUS);
+  const storeRunnerState = useStore((state) => state?.runner?.runnerState ?? OFFLINE);
+  const storeJobHistory = useStore((state) => state?.jobs?.history ?? NO_HISTORY);
   const storeIsLoading = useStore((state) => state?.ui?.isLoading ?? false);
   const storeIsInitialLoading = useStore((state) => state?.ui?.isInitialLoading ?? true);
   const storeError = useStore((state) => state?.ui?.error ?? null);
@@ -111,6 +133,8 @@ export const RunnerProvider: React.FC<RunnerProviderProps> = ({ children }) => {
   // Fallback state for when zubridge isn't ready
   const [fallbackState, setFallbackState] = useState({
     user: null as GitHubUser | null,
+    /** A stored session the app can no longer use: known user, no access. */
+    authExpired: false,
     isAuthenticating: false,
     deviceCode: null as DeviceCodeInfo | null,
     repos: [] as GitHubRepo[],
@@ -156,12 +180,46 @@ export const RunnerProvider: React.FC<RunnerProviderProps> = ({ children }) => {
   const isInitialLoading = isZubridgeReady ? storeIsInitialLoading : fallbackState.isInitialLoading;
   const error = isZubridgeReady ? storeError : fallbackState.error;
 
+  /**
+   * Re-read whether the session is expired.
+   *
+   * The flag is read when the provider mounts, so a session that recovers
+   * while the app is open went on being reported as expired until the app was
+   * restarted. Bails out when the value is unchanged - returning the same
+   * state object - so a caller cannot turn this into a render loop.
+   */
+  const refreshAuthExpiry = useCallback(async () => {
+    try {
+      const status = await window.localmost.github.getAuthStatus();
+      setFallbackState(prev =>
+        prev.authExpired === !!status.expired ? prev : { ...prev, authExpired: !!status.expired }
+      );
+    } catch {
+      // Leave the last known value; a failed query is not evidence either way.
+    }
+  }, []);
+
+  // Signing in changes the user, and that is the other way a session recovers.
+  //
+  // Keyed on the login, not the user object: getAuthStatus calls setUser on
+  // every invocation, so the bridged store delivers a fresh object each time
+  // and an object-keyed effect would re-run, re-query, and re-render without
+  // end - the update-depth crash this whole feature already caused twice.
+  const userLogin = user?.login ?? null;
+  useEffect(() => {
+    void refreshAuthExpiry();
+  }, [userLogin, refreshAuthExpiry]);
+
   // Load initial state via IPC (fallback until zubridge syncs)
   useEffect(() => {
     const loadState = async () => {
       try {
         // Check auth status
         const authStatus = await window.localmost.github.getAuthStatus();
+        // Reported only. Everything about how `user` is handled is left
+        // exactly as it was: this flag adds a badge, it does not change what
+        // the app thinks its state is.
+        setFallbackState(prev => ({ ...prev, authExpired: !!authStatus.expired }));
         if (authStatus.isAuthenticated && authStatus.user) {
           const user = authStatus.user;
           setFallbackState(prev => ({ ...prev, user }));
@@ -462,6 +520,8 @@ export const RunnerProvider: React.FC<RunnerProviderProps> = ({ children }) => {
 
   const value: RunnerContextValue = {
     user,
+    authExpired: fallbackState.authExpired,
+    refreshAuthExpiry,
     isAuthenticating,
     deviceCode,
     login,

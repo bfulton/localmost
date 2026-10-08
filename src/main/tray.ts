@@ -1,6 +1,7 @@
 import { Tray, Menu, nativeImage } from 'electron';
 import { TRAY_ANIMATION_FRAMES, TRAY_ANIMATION_INTERVAL_MS } from '../shared/constants';
 import { RunnerState } from '../shared/types';
+import { pauseReplacesStatus, resourcePauseOverriddenLine } from '../shared/resource-pause-text';
 import { getLogger } from './app-state';
 
 /**
@@ -21,12 +22,22 @@ export interface TrayCallbacks {
  */
 export interface TrayStatusInfo {
   isAuthenticated: boolean;
+  /** Signed in once, but the session is spent and needs signing in again. */
+  isSessionExpired?: boolean;
   isConfigured: boolean;
   runnerStatus?: RunnerState['status'];
   isBusy: boolean;
   isSleepBlocked?: boolean;
   isPaused?: boolean;
   pauseReason?: string | null;
+  /**
+   * The runner is started or starting: the runner a pause holds, and the one
+   * Pause and Resume act on. Outside that a pause is shown beside the
+   * status, with no Resume.
+   */
+  isRunnerStarted?: boolean;
+  /** The resource conditions a manual resume overrode, while they hold. */
+  pauseOverridden?: string | null;
   isWindowVisible?: boolean;
 }
 
@@ -109,6 +120,7 @@ export class TrayManager {
 
     // Build status label
     const statusLabel = this.getStatusLabel(status);
+    const pauseInPlace = pauseReplacesStatus(!!status.isPaused, status.isRunnerStarted);
 
     // Build context menu
     const menuItems: Electron.MenuItemConstructorOptions[] = [
@@ -117,6 +129,28 @@ export class TrayManager {
         enabled: false,
       },
     ];
+
+    // A pause on a runner that is not started or starting, beside its status
+    if (status.isAuthenticated && status.isConfigured && status.isPaused && status.pauseReason && !pauseInPlace) {
+      menuItems.push({
+        label: `⏸ ${status.pauseReason}`,
+        enabled: false,
+      });
+    }
+
+    // A resume that overrode a resource pause, until its condition clears
+    const overriddenLine = resourcePauseOverriddenLine({
+      isPaused: !!status.isPaused,
+      reason: status.pauseReason ?? null,
+      conditions: [],
+      overridden: status.pauseOverridden,
+    });
+    if (status.isAuthenticated && status.isConfigured && overriddenLine) {
+      menuItems.push({
+        label: overriddenLine,
+        enabled: false,
+      });
+    }
 
     // Add sleep blocked indicator if active
     if (status.isSleepBlocked) {
@@ -128,16 +162,19 @@ export class TrayManager {
 
     menuItems.push({ type: 'separator' });
 
-    // Add pause/resume option when configured
+    // Add pause/resume option when configured. Resume does nothing for a
+    // runner that is not started or starting, so it is not offered there.
     if (status.isAuthenticated && status.isConfigured) {
       if (status.isPaused) {
-        menuItems.push({
-          label: '▶  Resume',
-          click: () => {
-            getLogger()?.info('[Tray] Resume clicked');
-            this.callbacks.onResume();
-          },
-        });
+        if (pauseInPlace) {
+          menuItems.push({
+            label: '▶  Resume',
+            click: () => {
+              getLogger()?.info('[Tray] Resume clicked');
+              this.callbacks.onResume();
+            },
+          });
+        }
       } else {
         menuItems.push({
           label: '⏸  Pause',
@@ -408,14 +445,17 @@ export class TrayManager {
    */
   private getStatusLabel(status: TrayStatusInfo): string {
     if (!status.isAuthenticated) {
-      return 'GitHub: Not connected';
+      // Settings shows the same account as "Session expired" beside Reconnect.
+      return status.isSessionExpired
+        ? 'GitHub: Session expired, reconnect in Settings'
+        : 'GitHub: Not connected';
     }
     if (!status.isConfigured) {
       return 'Runner: Not configured';
     }
 
-    // Show pause reason if paused
-    if (status.isPaused && status.pauseReason) {
+    // Show the pause reason in place of the status of the runner it holds
+    if (status.pauseReason && pauseReplacesStatus(!!status.isPaused, status.isRunnerStarted)) {
       return `⏸ ${status.pauseReason}`;
     }
 

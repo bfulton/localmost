@@ -3,7 +3,8 @@
  */
 
 import * as os from 'os';
-import { app, ipcMain, net } from 'electron';
+import { app, net } from 'electron';
+import { ipcMain } from './trusted-ipc';
 import { getMainWindow, getRunnerManager, getHeartbeatManager } from '../app-state';
 import { confirmQuitIfBusy } from '../window';
 import { getLogSymlinkPath, sendLog } from '../logging';

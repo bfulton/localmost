@@ -1,19 +1,19 @@
 /**
  * Step Executor
  *
- * Executes workflow steps (both `run:` and `uses:` steps) with sandbox
- * support and proper environment setup.
+ * Executes workflow steps (both `run:` and `uses:` steps) for `localmost
+ * test`: each step runs where its StepRunner puts it - a macOS VM, from the
+ * same golden image as runner jobs (src/cli/test-vm.ts) - with the
+ * environment a GitHub-hosted step would see, its output masked of secrets
+ * as it streams back, and its outputs read from what it wrote to
+ * GITHUB_OUTPUT.
  */
 
 import * as fs from 'fs';
 import * as path from 'path';
-import * as os from 'os';
-import { spawn, SpawnOptions } from 'child_process';
 import { WorkflowStep, WorkflowJob, MatrixCombination } from './workflow-parser';
-import { SandboxPolicy, generateSandboxProfile, generateDiscoveryProfile } from './sandbox-profile';
-import { PidTreeWatcher } from './pid-tree-watch';
 import { parseActionRef, fetchAction, isInterceptedAction, readActionMetadata } from './action-fetcher';
-import { getGitInfo } from './workspace';
+import { resolveWithin } from './contained-path';
 
 // =============================================================================
 // Types
@@ -30,11 +30,51 @@ export interface StepResult {
   error?: string;
 }
 
+/** One step, as a StepRunner runs it. Paths are as the steps see them. */
+export interface RunnerStep {
+  /** A shell with its script, or node with an action's entry point. */
+  program: 'bash' | 'sh' | 'zsh' | 'node';
+  script?: string;
+  entry?: string;
+  /** Where the step starts: the workspace, or a directory in it. */
+  cwd: string;
+  env: Record<string, string>;
+  /** Each line the step prints, as it prints it. */
+  onLine: (line: string, stream: 'stdout' | 'stderr') => void;
+}
+
+export interface RunnerStepResult {
+  exitCode: number;
+  /** What the step wrote to GITHUB_OUTPUT. */
+  outputs: string;
+}
+
+/**
+ * Where a run's steps run. The workspace and every path a step is given are
+ * the runner's, not this machine's: a step sees none of the files here
+ * except what was sent in.
+ */
+export interface StepRunner {
+  /** The workspace as steps see it: GITHUB_WORKSPACE. */
+  readonly workDir: string;
+  /** Sends a directory of this machine's - an action's code - in for steps to use; resolves with where they see it. */
+  provide(hostDir: string): Promise<string>;
+  /** Runs one step to its end. */
+  run(step: RunnerStep): Promise<RunnerStepResult>;
+  /** Ends whatever the job's steps left running, as GitHub's runner does at the end of a job. */
+  endJob(): Promise<void>;
+}
+
 export interface ExecutionContext {
-  /** Working directory (GITHUB_WORKSPACE) */
+  /** The workspace as steps see it (GITHUB_WORKSPACE), in the runner. */
   workDir: string;
-  /** Port of the proxy server for network isolation */
-  proxyPort: number;
+  /**
+   * The copy of the checkout on this machine that the workspace was made
+   * from, before any step ran: where a local action's metadata is read.
+   */
+  hostWorkDir: string;
+  /** Where the steps run. */
+  runner: StepRunner;
   /** Workflow-level environment variables */
   workflowEnv: Record<string, string>;
   /** Job-level environment variables */
@@ -49,14 +89,6 @@ export interface ExecutionContext {
   inputs?: Record<string, string | number | boolean>;
   /** Outputs from jobs this job depends on (needs context) */
   needs?: Record<string, Record<string, string>>;
-  /** Sandbox policy to enforce */
-  policy?: SandboxPolicy;
-  /** Whether running in permissive/discovery mode */
-  permissive?: boolean;
-  /** Log file for sandbox trace output (for discovery mode) */
-  sandboxLogFile?: string;
-  /** Collected PIDs from sandbox processes (for discovery mode log filtering) */
-  collectedPids?: Set<number>;
   /** Callback for step output */
   onOutput?: (line: string, stream: 'stdout' | 'stderr') => void;
   /** Callback for step status changes */
@@ -123,20 +155,6 @@ export function createSecretMasker(secrets: Record<string, string>): {
 }
 
 /**
- * Create the workspace-local HOME a step runs with.
- *
- * Every step gets HOME inside the workspace, so every path that builds a step
- * environment needs the directory to exist - not just `run:` steps.
- */
-export function ensureStepHome(workDir: string): string {
-  const stepHome = path.join(workDir, '.home');
-  if (!fs.existsSync(stepHome)) {
-    fs.mkdirSync(stepHome, { recursive: true });
-  }
-  return stepHome;
-}
-
-/**
  * Replace secret values with *** wherever they appear.
  *
  * A step can print a secret by accident - `set -x`, a curl error echoing a
@@ -155,26 +173,43 @@ export function maskSecrets(text: string, secrets: Record<string, string>): stri
 }
 
 /**
+ * The default GITHUB_* and RUNNER_* variables the run sets. GitHub does not
+ * let a workflow, job or step overwrite them, and here all three are the
+ * checkout's to write: an `env:` naming GITHUB_REPOSITORY would otherwise
+ * give a step, and ${{ github.repository }}, another repository's identity.
+ * Other GITHUB_* names, such as GITHUB_TOKEN, stay the workflow's to set.
+ */
+export const RESERVED_ENV_NAMES = [
+  'GITHUB_ACTIONS', 'GITHUB_WORKFLOW', 'GITHUB_RUN_ID', 'GITHUB_RUN_NUMBER', 'GITHUB_JOB', 'GITHUB_ACTION',
+  'GITHUB_ACTOR', 'GITHUB_REPOSITORY', 'GITHUB_EVENT_NAME', 'GITHUB_WORKSPACE', 'GITHUB_SHA', 'GITHUB_REF',
+  'GITHUB_HEAD_REF', 'GITHUB_BASE_REF', 'GITHUB_SERVER_URL', 'GITHUB_API_URL', 'GITHUB_GRAPHQL_URL',
+  'GITHUB_ENV', 'GITHUB_PATH', 'GITHUB_STEP_SUMMARY',
+  'RUNNER_NAME', 'RUNNER_OS', 'RUNNER_ARCH', 'RUNNER_TEMP', 'RUNNER_TOOL_CACHE',
+] as const;
+type ReservedEnvName = (typeof RESERVED_ENV_NAMES)[number];
+const RESERVED_ENV = new Set<string>(RESERVED_ENV_NAMES);
+
+/** `env` without the names the run reserves (RESERVED_ENV_NAMES): a workflow's or job's own `env:`. */
+export function withoutReservedEnv(env: Record<string, string> | undefined): Record<string, string> {
+  return Object.fromEntries(Object.entries(env || {}).filter(([name]) => !RESERVED_ENV.has(name)));
+}
+
+/**
  * Build the full environment for step execution.
+ *
+ * The runner adds its own HOME, PATH, user, shell and temp, which a step's
+ * environment cannot replace: the guest's, not this machine's.
+ *
+ * The reserved variables are read from the run's own values in
+ * ctx.workflowEnv and ctx.jobEnv (which hold no workflow- or job-declared
+ * value for them) and set again after every merge, so no `env:` replaces one.
  */
 export function buildStepEnvironment(
   step: WorkflowStep,
   ctx: ExecutionContext,
   job: WorkflowJob
 ): Record<string, string> {
-  const env: Record<string, string> = {
-    // Preserve PATH and essential system vars
-    PATH: process.env.PATH || '',
-    // A home inside the workspace, not the user's. GitHub Actions gives a step
-    // the runner's home, and pointing at the real one both diverges from that
-    // and sends every tool looking for dotfiles the sandbox denies - git dies
-    // on ~/.gitconfig before it does anything.
-    HOME: ensureStepHome(ctx.workDir),
-    USER: process.env.USER || '',
-    SHELL: process.env.SHELL || '/bin/bash',
-    TERM: process.env.TERM || 'xterm-256color',
-    LANG: process.env.LANG || 'en_US.UTF-8',
-
+  const reserved: Record<ReservedEnvName, string> = {
     // GitHub Actions standard variables
     GITHUB_ACTIONS: 'true',
     GITHUB_WORKFLOW: ctx.workflowEnv.GITHUB_WORKFLOW || 'local',
@@ -193,36 +228,38 @@ export function buildStepEnvironment(
     GITHUB_SERVER_URL: 'https://github.com',
     GITHUB_API_URL: 'https://api.github.com',
     GITHUB_GRAPHQL_URL: 'https://api.github.com/graphql',
-    GITHUB_ENV: path.join(ctx.workDir, '.github-env'),
-    GITHUB_PATH: path.join(ctx.workDir, '.github-path'),
-    GITHUB_OUTPUT: path.join(ctx.workDir, '.github-output'),
-    GITHUB_STEP_SUMMARY: path.join(ctx.workDir, '.github-step-summary'),
+    GITHUB_ENV: path.posix.join(ctx.workDir, '.github-env'),
+    GITHUB_PATH: path.posix.join(ctx.workDir, '.github-path'),
+    GITHUB_STEP_SUMMARY: path.posix.join(ctx.workDir, '.github-step-summary'),
 
     // Runner information
     RUNNER_NAME: 'localmost',
     RUNNER_OS: 'macOS',
-    RUNNER_ARCH: process.arch === 'arm64' ? 'ARM64' : 'X64',
-    RUNNER_TEMP: path.join(ctx.workDir, '.runner-temp'),
-    RUNNER_TOOL_CACHE: path.join(os.homedir(), '.localmost', 'tool-cache'),
+    RUNNER_ARCH: 'ARM64',
+    // Per run, in the workspace, which the run makes before its first step.
+    RUNNER_TEMP: path.posix.join(ctx.workDir, RUNNER_TEMP_DIR),
+    RUNNER_TOOL_CACHE: path.posix.join(ctx.workDir, RUNNER_TOOL_CACHE_DIR),
+  };
 
+  // Add job defaults if present
+  if (job.defaults?.run?.['working-directory']) {
+    reserved.GITHUB_WORKSPACE = path.posix.join(ctx.workDir, job.defaults.run['working-directory']);
+  }
+
+  const env: Record<string, string> = {
+    TERM: process.env.TERM || 'xterm-256color',
+    LANG: process.env.LANG || 'en_US.UTF-8',
+    ...reserved,
     // ImageOS for setup-* actions
     ImageOS: 'macos14',
   };
 
-  // Add workflow-level env
-  Object.assign(env, ctx.workflowEnv);
-
-  // Add job-level env
-  Object.assign(env, ctx.jobEnv);
-
-  // Add job defaults if present
-  if (job.defaults?.run?.['working-directory']) {
-    env.GITHUB_WORKSPACE = path.join(ctx.workDir, job.defaults.run['working-directory']);
-  }
+  // Add workflow-level and job-level env
+  Object.assign(env, ctx.workflowEnv, ctx.jobEnv, reserved);
 
   // Add step-level env
   if (step.env) {
-    Object.assign(env, expandEnvValues(step.env, env, ctx));
+    Object.assign(env, expandEnvValues(step.env, env, ctx), reserved);
   }
 
   // Add matrix values
@@ -237,6 +274,10 @@ export function buildStepEnvironment(
 
   return env;
 }
+
+/** The workspace directories RUNNER_TEMP and RUNNER_TOOL_CACHE name, made before the first step. */
+export const RUNNER_TEMP_DIR = '.runner-temp';
+export const RUNNER_TOOL_CACHE_DIR = '.runner-tool-cache';
 
 /**
  * Expand environment variable references and expressions in values.
@@ -407,6 +448,22 @@ export async function executeStep(
   }
 }
 
+/** The shells a `run:` step may name, as the runner's programs. */
+const SHELLS: Record<string, RunnerStep['program']> = { bash: 'bash', sh: 'sh', zsh: 'zsh' };
+
+/**
+ * `target` inside the workspace as steps see it, or an error naming `what`.
+ * Lexical: the path is the runner's, and a link in it leads only where the
+ * step could go anyway.
+ */
+function withinWorkspace(ctx: ExecutionContext, target: string, what: string): string {
+  const resolved = path.posix.resolve(ctx.workDir, target);
+  if (resolved !== ctx.workDir && !resolved.startsWith(`${ctx.workDir}/`)) {
+    throw new Error(`${what} is outside the workspace: ${target}`);
+  }
+  return resolved;
+}
+
 /**
  * Execute a `run:` step.
  */
@@ -418,63 +475,26 @@ async function executeRunStep(
 ): Promise<StepResult> {
   const env = buildStepEnvironment(step, ctx, job);
   const shell = step.shell || job.defaults?.run?.shell || 'bash';
-  const workingDir =
-    step['working-directory'] ||
-    job.defaults?.run?.['working-directory'] ||
-    ctx.workDir;
+  const program = Object.hasOwn(SHELLS, shell) ? SHELLS[shell] : undefined;
+  if (!program) {
+    throw new Error(`shell: ${shell} is not available in the macOS VM; localmost test runs bash, sh and zsh`);
+  }
+  // Relative to the workspace, as on GitHub, and never outside it.
+  const namedDir = step['working-directory'] || job.defaults?.run?.['working-directory'];
+  const cwd = namedDir ? withinWorkspace(ctx, namedDir, 'working-directory') : ctx.workDir;
 
   // Expand expressions in the script
   const script = expandExpression(step.run!, env, ctx);
 
-  // Create GITHUB_OUTPUT file
-  const outputFile = env.GITHUB_OUTPUT;
-  fs.writeFileSync(outputFile, '');
-
-  // Create temp script file
-  const scriptFile = path.join(ctx.workDir, `.step-${Date.now()}.sh`);
-  // 0700, not 0755: expanding ${{ secrets.X }} puts the value in this file for
-  // as long as the step runs, and another account should not be able to read it.
-  fs.writeFileSync(scriptFile, script, { mode: 0o700 });
-
-  ensureStepHome(ctx.workDir);
-
-  try {
-    const result = await runInSandbox(
-      shell,
-      [scriptFile],
-      {
-        cwd: workingDir,
-        env,
-        proxyPort: ctx.proxyPort,
-        onOutput: ctx.onOutput,
-        sandboxLogFile: ctx.sandboxLogFile,
-        collectedPids: ctx.collectedPids,
-        secrets: ctx.secrets,
-      },
-      ctx.policy,
-      ctx.permissive
-    );
-
-    // Parse outputs from GITHUB_OUTPUT file
-    const outputs = parseGitHubOutputFile(outputFile);
-
-    // Clean up
-    fs.unlinkSync(scriptFile);
-
-    return {
-      name: stepName,
-      status: result.exitCode === 0 ? 'success' : 'failure',
-      exitCode: result.exitCode,
-      duration: 0,
-      outputs,
-      error: result.exitCode !== 0 && result.stderr ? result.stderr : undefined,
-    };
-  } finally {
-    // Ensure cleanup
-    if (fs.existsSync(scriptFile)) {
-      fs.unlinkSync(scriptFile);
-    }
-  }
+  const result = await runOnRunner(ctx, { program, script, cwd, env });
+  return {
+    name: stepName,
+    status: result.exitCode === 0 ? 'success' : 'failure',
+    exitCode: result.exitCode,
+    duration: 0,
+    outputs: result.outputs,
+    error: result.exitCode !== 0 && result.stderr ? result.stderr : undefined,
+  };
 }
 
 /**
@@ -507,11 +527,14 @@ async function executeActionStep(
   ctx.onOutput?.(`Fetching action ${uses}...`, 'stdout');
   const cached = await fetchAction(ref);
 
-  return await executeActionFromPath(cached.localPath, step, ctx, job, stepName);
+  return await executeActionFromPath(cached.localPath, () => ctx.runner.provide(cached.localPath), step, ctx, job, stepName);
 }
 
 /**
  * Execute a local action (./path/to/action).
+ *
+ * Its action.yml is read from this machine's copy of the checkout, which
+ * is what the workspace was made from; the step runs it from the workspace.
  */
 async function executeLocalAction(
   step: WorkflowStep,
@@ -519,23 +542,26 @@ async function executeLocalAction(
   job: WorkflowJob,
   stepName: string
 ): Promise<StepResult> {
-  const actionPath = path.join(ctx.workDir, step.uses!);
-  return await executeActionFromPath(actionPath, step, ctx, job, stepName);
+  const hostPath = resolveWithin(ctx.hostWorkDir, step.uses!, 'Local action');
+  const relative = path.relative(fs.realpathSync(ctx.hostWorkDir), hostPath).split(path.sep).join('/');
+  return await executeActionFromPath(hostPath, async () => path.posix.join(ctx.workDir, relative), step, ctx, job, stepName);
 }
 
 /**
- * Execute an action from a local path.
+ * Execute an action from a local path: `hostPath` holds its code on this
+ * machine, and `guestPath` says where steps see it, sending it in if need be.
  */
 async function executeActionFromPath(
-  actionPath: string,
+  hostPath: string,
+  guestPath: () => Promise<string>,
   step: WorkflowStep,
   ctx: ExecutionContext,
   job: WorkflowJob,
   stepName: string
 ): Promise<StepResult> {
-  const metadata = readActionMetadata(actionPath);
+  const metadata = readActionMetadata(hostPath);
   if (!metadata) {
-    throw new Error(`No action.yml found in ${actionPath}`);
+    throw new Error(`No action.yml found in ${hostPath}`);
   }
 
   const env = buildStepEnvironment(step, ctx, job);
@@ -558,10 +584,6 @@ async function executeActionFromPath(
     }
   }
 
-  // Create GITHUB_OUTPUT file
-  const outputFile = env.GITHUB_OUTPUT;
-  fs.writeFileSync(outputFile, '');
-
   // Execute based on action type
   const { using, main } = metadata.runs;
 
@@ -576,31 +598,19 @@ async function executeActionFromPath(
       throw new Error('Node action missing "main" entry point');
     }
 
-    const mainPath = path.join(actionPath, main);
-    const result = await runInSandbox(
-      'node',
-      [mainPath],
-      {
-        cwd: actionPath,
-        env,
-        proxyPort: ctx.proxyPort,
-        onOutput: ctx.onOutput,
-        sandboxLogFile: ctx.sandboxLogFile,
-        collectedPids: ctx.collectedPids,
-        secrets: ctx.secrets,
-      },
-      ctx.policy,
-      ctx.permissive
-    );
-
-    const outputs = parseGitHubOutputFile(outputFile);
+    // GitHub runs a node action from the workspace, not from its own
+    // directory, with the runner's own node.
+    const mainPath = resolveWithin(hostPath, main, 'Action entry point', 'the action');
+    const relative = path.relative(fs.realpathSync(hostPath), mainPath).split(path.sep).join('/');
+    const entry = path.posix.join(await guestPath(), relative);
+    const result = await runOnRunner(ctx, { program: 'node', entry, cwd: ctx.workDir, env });
 
     return {
       name: stepName,
       status: result.exitCode === 0 ? 'success' : 'failure',
       exitCode: result.exitCode,
       duration: 0,
-      outputs,
+      outputs: result.outputs,
       error: result.exitCode !== 0 && result.stderr ? result.stderr : undefined,
     };
   }
@@ -703,13 +713,12 @@ async function executeInterceptedAction(
     return executeCheckoutIntercept(step, ctx, stepName);
   }
 
-  // actions/cache (restore and save variants)
+  // actions/cache/save saves; actions/cache and actions/cache/restore restore,
+  // neither of which the macOS VM keeps yet
+  if (uses.startsWith('actions/cache/save@')) {
+    return executeCacheSaveIntercept(step, ctx, stepName);
+  }
   if (uses.startsWith('actions/cache')) {
-    // actions/cache/save is for saving only
-    if (uses.includes('/save')) {
-      return executeCacheSaveIntercept(step, ctx, stepName);
-    }
-    // actions/cache/restore is for restore only, regular actions/cache does both
     return executeCacheIntercept(step, ctx, stepName);
   }
 
@@ -754,27 +763,15 @@ function executeCheckoutIntercept(
     };
   }
 
-  // Use local working tree
-  const gitInfo = getGitInfo(ctx.workDir);
-  if (gitInfo) {
-    ctx.workflowEnv.GITHUB_SHA = gitInfo.sha;
-    ctx.workflowEnv.GITHUB_REF = gitInfo.ref;
-  }
-
+  // Use the local working tree: the workspace is a copy of it, sent into the
+  // macOS VM before the first step. GITHUB_SHA and GITHUB_REF were read from
+  // the checkout the run was started in, before any step ran.
   ctx.onOutput?.('Using local working tree (checkout intercepted)', 'stdout');
 
-  // Handle submodules
+  // Submodules come with the working tree: the workspace is a copy of the
+  // checkout, initialized submodules included.
   if (step.with?.submodules === 'true' || step.with?.submodules === true) {
-    ctx.onOutput?.('Updating submodules...', 'stdout');
-    try {
-      const { execSync } = require('child_process');
-      execSync('git submodule update --init --recursive', {
-        cwd: ctx.workDir,
-        stdio: 'pipe',
-      });
-    } catch (err) {
-      ctx.onOutput?.(`Warning: Failed to update submodules: ${(err as Error).message}`, 'stderr');
-    }
+    ctx.onOutput?.('Submodules: using those already checked out in the working tree', 'stdout');
   }
 
   return {
@@ -786,224 +783,23 @@ function executeCheckoutIntercept(
 }
 
 /**
- * Get the local cache directory for workflow caches.
+ * Intercept actions/cache and actions/cache/restore: always a miss. Caches
+ * are not kept between runs in the macOS VM yet, and a miss is what a step
+ * must cope with anyway.
  */
-function getLocalCacheDir(): string {
-  return path.join(os.homedir(), '.localmost', 'workflow-cache');
+function executeCacheIntercept(step: WorkflowStep, ctx: ExecutionContext, stepName: string): StepResult {
+  ctx.onOutput?.(`Cache: not restored (${String(step.with?.key ?? 'no key')}) - localmost test keeps no caches in the macOS VM yet`, 'stdout');
+  return { name: stepName, status: 'success', duration: 0, outputs: { 'cache-hit': 'false' } };
+}
+
+/** Intercept actions/cache/save: nothing is saved, as nothing is restored. */
+function executeCacheSaveIntercept(step: WorkflowStep, ctx: ExecutionContext, stepName: string): StepResult {
+  ctx.onOutput?.(`Cache save: skipped (${String(step.with?.key ?? 'no key')}) - localmost test keeps no caches in the macOS VM yet`, 'stdout');
+  return { name: stepName, status: 'success', duration: 0, outputs: {} };
 }
 
 /**
- * Create a safe directory name from a cache key.
- */
-function sanitizeCacheKey(key: string): string {
-  // Replace unsafe characters with underscores
-  return key.replace(/[^a-zA-Z0-9_-]/g, '_').slice(0, 200);
-}
-
-/**
- * Intercept actions/cache - use local cache directory.
- */
-function executeCacheIntercept(
-  step: WorkflowStep,
-  ctx: ExecutionContext,
-  stepName: string
-): StepResult {
-  const key = step.with?.key as string | undefined;
-  const cachePath = step.with?.path as string | undefined;
-  const restoreKeys = step.with?.['restore-keys'] as string | undefined;
-
-  if (!key || !cachePath) {
-    ctx.onOutput?.('Cache: missing key or path', 'stdout');
-    return {
-      name: stepName,
-      status: 'success',
-      duration: 0,
-      outputs: { 'cache-hit': 'false' },
-    };
-  }
-
-  ctx.onOutput?.(`Cache (local): key=${key}, path=${cachePath}`, 'stdout');
-
-  const cacheDir = getLocalCacheDir();
-  const sanitizedKey = sanitizeCacheKey(key);
-  const cacheEntryDir = path.join(cacheDir, sanitizedKey);
-
-  // Check for exact match first
-  if (fs.existsSync(cacheEntryDir)) {
-    ctx.onOutput?.(`Cache hit: ${key}`, 'stdout');
-    return restoreCacheEntry(cacheEntryDir, cachePath, ctx, stepName, true);
-  }
-
-  // Check restore keys for prefix match
-  if (restoreKeys) {
-    const prefixes = restoreKeys.split('\n').map(k => k.trim()).filter(Boolean);
-    try {
-      if (!fs.existsSync(cacheDir)) {
-        fs.mkdirSync(cacheDir, { recursive: true });
-      }
-      const entries = fs.readdirSync(cacheDir);
-
-      for (const prefix of prefixes) {
-        const sanitizedPrefix = sanitizeCacheKey(prefix);
-        // Find entries that start with this prefix
-        const match = entries.find(entry => entry.startsWith(sanitizedPrefix));
-        if (match) {
-          ctx.onOutput?.(`Cache restored from key prefix: ${prefix}`, 'stdout');
-          return restoreCacheEntry(path.join(cacheDir, match), cachePath, ctx, stepName, false);
-        }
-      }
-    } catch (err) {
-      ctx.onOutput?.(`Cache lookup error: ${(err as Error).message}`, 'stderr');
-    }
-  }
-
-  ctx.onOutput?.('Cache miss', 'stdout');
-  return {
-    name: stepName,
-    status: 'success',
-    duration: 0,
-    outputs: { 'cache-hit': 'false' },
-  };
-}
-
-/**
- * Restore a cache entry to the workspace.
- */
-function restoreCacheEntry(
-  cacheEntryDir: string,
-  targetPath: string,
-  ctx: ExecutionContext,
-  stepName: string,
-  exactMatch: boolean
-): StepResult {
-  try {
-    // Handle multiple paths separated by newlines
-    const paths = targetPath.split('\n').map(p => p.trim()).filter(Boolean);
-
-    for (const singlePath of paths) {
-      const absoluteTarget = path.isAbsolute(singlePath)
-        ? singlePath
-        : path.join(ctx.workDir, singlePath);
-
-      const cachedPath = path.join(cacheEntryDir, sanitizeCacheKey(singlePath));
-
-      if (fs.existsSync(cachedPath)) {
-        // Ensure parent directory exists
-        const parentDir = path.dirname(absoluteTarget);
-        if (!fs.existsSync(parentDir)) {
-          fs.mkdirSync(parentDir, { recursive: true });
-        }
-
-        // Copy cached files to target
-        copyDirRecursive(cachedPath, absoluteTarget);
-        ctx.onOutput?.(`  Restored: ${singlePath}`, 'stdout');
-      }
-    }
-
-    return {
-      name: stepName,
-      status: 'success',
-      duration: 0,
-      outputs: { 'cache-hit': exactMatch ? 'true' : 'false' },
-    };
-  } catch (err) {
-    ctx.onOutput?.(`Cache restore error: ${(err as Error).message}`, 'stderr');
-    return {
-      name: stepName,
-      status: 'success',
-      duration: 0,
-      outputs: { 'cache-hit': 'false' },
-    };
-  }
-}
-
-/**
- * Copy a directory recursively.
- */
-function copyDirRecursive(src: string, dest: string): void {
-  const stat = fs.statSync(src);
-
-  if (stat.isDirectory()) {
-    if (!fs.existsSync(dest)) {
-      fs.mkdirSync(dest, { recursive: true });
-    }
-    for (const entry of fs.readdirSync(src)) {
-      copyDirRecursive(path.join(src, entry), path.join(dest, entry));
-    }
-  } else {
-    fs.copyFileSync(src, dest);
-  }
-}
-
-/**
- * Intercept actions/cache/save - save to local cache directory.
- */
-function executeCacheSaveIntercept(
-  step: WorkflowStep,
-  ctx: ExecutionContext,
-  stepName: string
-): StepResult {
-  const key = step.with?.key as string | undefined;
-  const cachePath = step.with?.path as string | undefined;
-
-  if (!key || !cachePath) {
-    ctx.onOutput?.('Cache save: missing key or path', 'stdout');
-    return {
-      name: stepName,
-      status: 'success',
-      duration: 0,
-      outputs: {},
-    };
-  }
-
-  ctx.onOutput?.(`Cache save (local): key=${key}, path=${cachePath}`, 'stdout');
-
-  const cacheDir = getLocalCacheDir();
-  const sanitizedKey = sanitizeCacheKey(key);
-  const cacheEntryDir = path.join(cacheDir, sanitizedKey);
-
-  try {
-    // Handle multiple paths separated by newlines
-    const paths = cachePath.split('\n').map(p => p.trim()).filter(Boolean);
-
-    // Create cache entry directory
-    if (!fs.existsSync(cacheEntryDir)) {
-      fs.mkdirSync(cacheEntryDir, { recursive: true });
-    }
-
-    for (const singlePath of paths) {
-      const absoluteSource = path.isAbsolute(singlePath)
-        ? singlePath
-        : path.join(ctx.workDir, singlePath);
-
-      if (fs.existsSync(absoluteSource)) {
-        const cachedPath = path.join(cacheEntryDir, sanitizeCacheKey(singlePath));
-        copyDirRecursive(absoluteSource, cachedPath);
-        ctx.onOutput?.(`  Saved: ${singlePath}`, 'stdout');
-      } else {
-        ctx.onOutput?.(`  Skipped (not found): ${singlePath}`, 'stdout');
-      }
-    }
-
-    return {
-      name: stepName,
-      status: 'success',
-      duration: 0,
-      outputs: {},
-    };
-  } catch (err) {
-    ctx.onOutput?.(`Cache save error: ${(err as Error).message}`, 'stderr');
-    return {
-      name: stepName,
-      status: 'success', // Cache save failure shouldn't fail the workflow
-      duration: 0,
-      outputs: {},
-    };
-  }
-}
-
-/**
- * Intercept actions/upload-artifact - save to local directory.
+ * Intercept actions/upload-artifact - stubbed.
  */
 function executeUploadArtifactIntercept(
   step: WorkflowStep,
@@ -1013,13 +809,7 @@ function executeUploadArtifactIntercept(
   const name = step.with?.name as string | undefined || 'artifact';
   const artifactPath = step.with?.path as string | undefined;
 
-  const artifactsDir = path.join(ctx.workDir, '.localmost-artifacts');
-  if (!fs.existsSync(artifactsDir)) {
-    fs.mkdirSync(artifactsDir, { recursive: true });
-  }
-
   ctx.onOutput?.(`Artifact stubbed: ${name} (would upload ${artifactPath})`, 'stdout');
-  ctx.onOutput?.(`Artifacts would be saved to: ${artifactsDir}`, 'stdout');
 
   return {
     name: stepName,
@@ -1051,188 +841,55 @@ function executeDownloadArtifactIntercept(
 }
 
 // =============================================================================
-// Sandbox Execution
+// Running a Step
 // =============================================================================
 
-interface SandboxResult {
-  exitCode: number;
-  stderr: string;
-}
-
 /**
- * Run a command in the sandbox.
+ * Run one step on the context's runner: its output masked of secrets and
+ * passed on line by line, its last stderr lines kept for the error, and its
+ * GITHUB_OUTPUT parsed.
  */
-async function runInSandbox(
-  command: string,
-  args: string[],
-  options: {
-    cwd: string;
-    env: Record<string, string>;
-    proxyPort: number;
-    onOutput?: (line: string, stream: 'stdout' | 'stderr') => void;
-    sandboxLogFile?: string;
-    collectedPids?: Set<number>;
-    /** Values to redact from anything the step prints */
-    secrets?: Record<string, string>;
-  },
-  policy?: SandboxPolicy,
-  permissive?: boolean
-): Promise<SandboxResult> {
-  return new Promise((resolve, reject) => {
-    let spawnArgs: string[];
-    let spawnCommand: string;
-    let usedSandbox = false;
+async function runOnRunner(
+  ctx: ExecutionContext,
+  step: Omit<RunnerStep, 'onLine'>
+): Promise<{ exitCode: number; outputs: Record<string, string>; stderr: string }> {
+  const secrets = ctx.secrets || {};
+  const stderrLines: string[] = [];
 
-    if (process.platform === 'darwin') {
-      let profile: string;
-
-      const isDiscovery = !!permissive && !!options.sandboxLogFile;
-      if (isDiscovery) {
-        // Discovery mode: use special profile that logs all access
-        profile = generateDiscoveryProfile({
-          workDir: options.cwd,
-          proxyPort: options.proxyPort,
-          logFile: options.sandboxLogFile ?? '',
-        });
-      } else {
-        // Strict mode: no policy provided and not permissive
-        // In strict mode, we block access to user caches (~/.npm, etc.)
-        const strictMode = !policy && !permissive;
-
-        // Enforcement mode: apply sandbox with policy restrictions
-        profile = generateSandboxProfile({
-          workDir: options.cwd,
-          proxyPort: options.proxyPort,
-          policy: policy || {},  // Empty policy = no network allowlist
-          permissive: false,
-          strictMode,
-          logFile: options.sandboxLogFile,
-        });
-      }
-
-      // Write profile to temp file
-      const profilePath = path.join(os.tmpdir(), `localmost-sandbox-${Date.now()}.sb`);
-      fs.writeFileSync(profilePath, profile);
-
-      // Save a copy for inspection, but only when discovering: a normal run
-      // should not write into the workspace, which may be the user's checkout
-      // or an action's own directory. Keyed off discovery mode, not
-      // sandboxLogFile - the CLI sets that on every run, discovery or not.
-      if (isDiscovery) {
-        const debugProfilePath = path.join(options.cwd, '.debug', 'sandbox-profile.sb');
-        const debugDir = path.dirname(debugProfilePath);
-        if (!fs.existsSync(debugDir)) {
-          fs.mkdirSync(debugDir, { recursive: true });
-        }
-        fs.writeFileSync(debugProfilePath, profile);
-      }
-
-      spawnCommand = '/usr/bin/sandbox-exec';
-      usedSandbox = true;
-      spawnArgs = ['-f', profilePath, command, ...args];
-    } else {
-      spawnCommand = command;
-      spawnArgs = args;
-    }
-
-    // No DOCKER_HOST here. The runner points a job at the filtering socket
-    // it serves; test mode does not serve one yet, and the profile keeps the
-    // daemon's own socket closed, so a job under localmost test runs without
-    // Docker rather than with an unfiltered daemon.
-    const spawnOptions: SpawnOptions = {
-      cwd: options.cwd,
-      env: options.env,
-      shell: false,
-      stdio: ['ignore', 'pipe', 'pipe'],
+  // Lines come whole from the runner, but a multi-line secret spans them,
+  // so masking carries its state across lines as it would across chunks.
+  const makeSink = (stream: 'stdout' | 'stderr') => {
+    const masker = createSecretMasker(secrets);
+    let pending = '';
+    const emit = (line: string) => {
+      if (!line) return;
+      if (stream === 'stderr') stderrLines.push(line);
+      ctx.onOutput?.(line, stream);
     };
-
-    const proc = spawn(spawnCommand, spawnArgs, spawnOptions);
-    const stderrLines: string[] = [];
-
-    // Track process tree using kqueue-based PidTreeWatcher for discovery mode
-    let pidWatcher: PidTreeWatcher | undefined;
-    if (options.collectedPids && proc.pid) {
-      options.collectedPids.add(proc.pid);
-      pidWatcher = new PidTreeWatcher();
-      pidWatcher.start(proc.pid);
-    }
-
-    const secrets = options.secrets || {};
-
-    // Chunk boundaries are arbitrary, so both masking and line splitting have to
-    // carry state across chunks; doing either per chunk leaks secrets and breaks
-    // lines in half.
-    const makeSink = (stream: 'stdout' | 'stderr') => {
-      const masker = createSecretMasker(secrets);
-      let pending = '';
-
-      const emit = (line: string) => {
-        if (!line) return;
-        if (stream === 'stderr') stderrLines.push(line);
-        options.onOutput?.(line, stream);
-      };
-
-      return {
-        write(chunk: string) {
-          pending += masker.push(chunk);
-          const lines = pending.split('\n');
-          pending = lines.pop() ?? '';
-          for (const line of lines) emit(line);
-        },
-        end() {
-          pending += masker.flush();
-          for (const line of pending.split('\n')) emit(line);
-          pending = '';
-        },
-      };
+    return {
+      write(chunk: string) {
+        pending += masker.push(chunk);
+        const lines = pending.split('\n');
+        pending = lines.pop() ?? '';
+        for (const line of lines) emit(line);
+      },
+      end() {
+        pending += masker.flush();
+        for (const line of pending.split('\n')) emit(line);
+        pending = '';
+      },
     };
+  };
+  const sinks = { stdout: makeSink('stdout'), stderr: makeSink('stderr') };
 
-    const stdoutSink = makeSink('stdout');
-    const stderrSink = makeSink('stderr');
+  const result = await ctx.runner.run({ ...step, onLine: (line, stream) => sinks[stream].write(`${line}\n`) });
+  sinks.stdout.end();
+  sinks.stderr.end();
 
-    proc.stdout?.on('data', (data: Buffer) => stdoutSink.write(data.toString()));
-    proc.stderr?.on('data', (data: Buffer) => stderrSink.write(data.toString()));
-
-    proc.on('close', (code) => {
-      // Release any output still held back for masking or an unterminated line.
-      stdoutSink.end();
-      stderrSink.end();
-
-      // Stop PID watcher and collect all PIDs
-      if (pidWatcher && options.collectedPids) {
-        const watchedPids = pidWatcher.stop();
-        for (const pid of watchedPids) {
-          options.collectedPids.add(pid);
-        }
-      }
-
-      // Already masked on the way in, but the error surfaces in job history
-      // and notifications, so mask again rather than rely on that.
-      let stderr = maskSecrets(stderrLines.slice(-10).join('\n'), secrets);
-
-      // A sandboxed process that dies on SIGABRT with nothing on stderr has
-      // almost always been denied something it needed before it could run -
-      // dyld cannot even load the binary. The bare exit code says none of that.
-      const abortedSilently = code === 134 && stderrLines.length === 0;
-      if (abortedSilently && usedSandbox) {
-        stderr =
-          'The step was stopped by the sandbox before it could run. ' +
-          'Its policy is probably missing a read path the process needs. ' +
-          'Run "localmost test --updaterc" to discover what it wants, or ' +
-          '"localmost policy init" to start from a policy that runs.';
-        options.onOutput?.(stderr, 'stderr');
-      }
-
-      resolve({ exitCode: code ?? 1, stderr });
-    });
-
-    proc.on('error', (err) => {
-      if (pidWatcher) {
-        pidWatcher.stop();
-      }
-      reject(err);
-    });
-  });
+  // Already masked on the way in, but the error surfaces in the summary, so
+  // mask again rather than rely on that.
+  const stderr = maskSecrets(stderrLines.slice(-10).join('\n'), secrets);
+  return { exitCode: result.exitCode, outputs: parseGitHubOutput(result.outputs), stderr };
 }
 
 // =============================================================================
@@ -1243,12 +900,7 @@ async function runInSandbox(
  * Parse the GITHUB_OUTPUT file format.
  * Format: name=value or name<<EOF\nvalue\nEOF
  */
-function parseGitHubOutputFile(filePath: string): Record<string, string> {
-  if (!fs.existsSync(filePath)) {
-    return {};
-  }
-
-  const content = fs.readFileSync(filePath, 'utf-8');
+function parseGitHubOutput(content: string): Record<string, string> {
   const outputs: Record<string, string> = {};
 
   const lines = content.split('\n');

@@ -4,10 +4,19 @@
  * Handles parsing, validation, and merging of declarative sandbox policies.
  */
 import * as yaml from 'js-yaml';
-import { POLICY_SECTION_KEYS, WORKFLOW_POLICY_KEYS } from './policy-describe';
+import {
+  LOCALMOSTRC_KEYS,
+  POLICY_SECTION_KEYS,
+  POLICY_SECTION_SUBKEYS,
+  PolicyScope,
+  WORKFLOW_POLICY_KEYS,
+} from './policy-describe';
+import * as crypto from 'crypto';
 import * as fs from 'fs';
+import * as net from 'net';
 import * as path from 'path';
-import { SandboxPolicy, NetworkPolicy, FilesystemPolicy, EnvPolicy } from './sandbox-profile';
+import { canonicalHost, parseHostPattern } from './egress-screen';
+import { PolicyRules, NetworkPolicy, FilesystemPolicy, EnvPolicy } from './policy-types';
 import { SandboxPolicyLevel } from './types';
 import {
   validateDockerPolicy,
@@ -27,9 +36,31 @@ export interface SecretsPolicy {
   require?: string[];
 }
 
-export interface WorkflowPolicy extends SandboxPolicy {
+export interface WorkflowPolicy extends PolicyRules {
   secrets?: SecretsPolicy;
 }
+
+/** What `shared:` may declare. */
+export type SharedPolicy = PolicyRules;
+
+/**
+ * Keys a policy section once accepted that no longer decide anything. A
+ * file that still has one parses, with a warning naming it, and the key is
+ * dropped from the policy, so it is neither approved nor shown as a grant.
+ * `isolation:` chose among isolation types; every job now runs in a macOS VM.
+ */
+const IGNORED_POLICY_KEYS: Readonly<Record<string, string>> = Object.freeze({
+  isolation: 'every job runs in a macOS VM, so there is no isolation type to choose',
+});
+
+/**
+ * The same, inside the network section. `network.loopback` opened ports on
+ * this Mac's loopback to a job's sandbox; a job's macOS VM has a loopback of
+ * its own, and reaches this Mac only through its proxy.
+ */
+const IGNORED_NETWORK_KEYS: Readonly<Record<string, string>> = Object.freeze({
+  loopback: "a job's macOS VM has its own loopback, and reaches this Mac only through its proxy",
+});
 
 export interface LocalmostrcConfig {
   /** Config file version */
@@ -40,7 +71,7 @@ export interface LocalmostrcConfig {
    */
   level?: SandboxPolicyLevel;
   /** Shared policy applied to all workflows */
-  shared?: SandboxPolicy;
+  shared?: SharedPolicy;
   /** Per-workflow policy overrides */
   workflows?: Record<string, WorkflowPolicy>;
 }
@@ -62,42 +93,163 @@ export interface ParseResult {
 // Parsing
 // =============================================================================
 
-const LOCALMOSTRC_FILENAMES = ['.localmostrc', '.localmostrc.yml', '.localmostrc.yaml'];
+/**
+ * The name of a repository's policy file, at its root, and the only one. The
+ * runner fetches the file by this name at a job's commit, and the CLI reads
+ * and writes it by this name in a checkout, so both apply the same policy:
+ * `localmost test` under grants a real job never gets would pass a workflow
+ * the runner then fails.
+ */
+export const LOCALMOSTRC_FILENAME = '.localmostrc';
+
+/**
+ * Names the CLI once read as well. They are not policies: they are looked
+ * for only to tell a checkout holding one why its file is not in effect.
+ */
+const UNREAD_LOCALMOSTRC_NAMES = ['.localmostrc.yml', '.localmostrc.yaml'];
+
+/**
+ * Why what is at a .localmostrc path is refused, or null when it is a regular
+ * file or nothing.
+ *
+ * The file comes with the checkout, so whoever controls the repository
+ * decides what is at that name, and the CLI that reads and writes it runs as
+ * the user, outside any sandbox. A link there - dangling, which reads as no
+ * file at all - would have a write land wherever it points, outside the
+ * checkout; a device or FIFO would have a read never return. Only a regular
+ * file is a policy.
+ */
+function notRegularFile(filePath: string, stat: fs.Stats | null): string | null {
+  if (stat === null || stat.isFile()) return null;
+  return refusal(
+    filePath,
+    stat.isSymbolicLink() ? 'a link' : stat.isDirectory() ? 'a directory' : 'a device, FIFO or socket'
+  );
+}
+
+function refusal(filePath: string, kind: string): string {
+  return (
+    `${filePath} is not a regular file (it is ${kind}), so localmost will not read or write it. ` +
+    'Replace it with a regular file, or remove it.'
+  );
+}
+
+/** lstat, with null for nothing there. */
+function lstatOrNull(filePath: string): fs.Stats | null {
+  try {
+    return fs.lstatSync(filePath);
+  } catch (err) {
+    if ((err as NodeJS.ErrnoException).code === 'ENOENT') return null;
+    throw err;
+  }
+}
 
 /**
  * Find the .localmostrc file in a repository.
+ *
+ * Throws when anything but a regular file is at the name, rather than
+ * skipping it: a link or device where the policy belongs is refused
+ * outright, not read past or written through.
  */
 export function findLocalmostrc(repoRoot: string): string | null {
-  for (const filename of LOCALMOSTRC_FILENAMES) {
-    const filePath = path.join(repoRoot, filename);
-    if (fs.existsSync(filePath)) {
-      return filePath;
-    }
+  const filePath = path.join(repoRoot, LOCALMOSTRC_FILENAME);
+  const stat = lstatOrNull(filePath);
+  if (stat === null) return null;
+  const problem = notRegularFile(filePath, stat);
+  if (problem) throw new Error(problem);
+  return filePath;
+}
+
+/**
+ * Why a repository with no .localmostrc may have been expected to have a
+ * policy: a file under a name localmost does not read, such as
+ * .localmostrc.yml. Null when there is none. The name is only looked at,
+ * never followed or read.
+ */
+export function unreadLocalmostrcNote(repoRoot: string): string | null {
+  for (const name of UNREAD_LOCALMOSTRC_NAMES) {
+    if (lstatOrNull(path.join(repoRoot, name)) === null) continue;
+    return (
+      `${name} is not read: localmost takes a repository's policy only from ${LOCALMOSTRC_FILENAME}, ` +
+      `for jobs and for localmost test alike. Rename it to ${LOCALMOSTRC_FILENAME} to use it. ` +
+      `A ${LOCALMOSTRC_FILENAME} that localmost writes does not start from it: rename it first to keep its grants.`
+    );
   }
   return null;
 }
 
 /**
+ * Write a .localmostrc, replacing a regular file or creating one, and never
+ * following a link.
+ *
+ * The content goes to a new file created beside the destination - O_EXCL, so
+ * not through anything already at that name - which is then renamed over it.
+ * A rename replaces a link rather than writing through it, so even a link
+ * swapped in after the check below cannot carry the write out of the
+ * checkout. A replaced file keeps its mode; a new one is 0644, as a file to
+ * be checked in is, rather than the CLI's private umask.
+ */
+export function writeLocalmostrc(filePath: string, content: string): void {
+  const check = (): fs.Stats | null => {
+    const stat = lstatOrNull(filePath);
+    const problem = notRegularFile(filePath, stat);
+    if (problem) throw new Error(problem);
+    return stat;
+  };
+  const existing = check();
+  const mode = existing ? existing.mode & 0o777 : 0o644;
+
+  const temp = path.join(
+    path.dirname(filePath),
+    `.${path.basename(filePath)}.${process.pid}.${crypto.randomBytes(6).toString('hex')}.tmp`
+  );
+  const fd = fs.openSync(temp, 'wx', mode);
+  try {
+    try {
+      fs.fchmodSync(fd, mode);
+      fs.writeFileSync(fd, content);
+    } finally {
+      fs.closeSync(fd);
+    }
+    check();
+    fs.renameSync(temp, filePath);
+  } catch (err) {
+    fs.rmSync(temp, { force: true });
+    throw err;
+  }
+}
+
+/**
  * Parse a .localmostrc file.
+ *
+ * Opened without following a link and without blocking, and read only once
+ * the open file is known to be a regular one: a link swapped in after
+ * findLocalmostrc looked is refused rather than followed, and a FIFO or
+ * device is refused rather than waited on or read forever.
  */
 export function parseLocalmostrc(filePath: string): ParseResult {
-  if (!fs.existsSync(filePath)) {
-    return {
-      success: false,
-      errors: [{ message: `File not found: ${filePath}` }],
-      warnings: [],
-    };
+  const failed = (message: string): ParseResult => ({ success: false, errors: [{ message }], warnings: [] });
+
+  let fd: number;
+  try {
+    fd = fs.openSync(filePath, fs.constants.O_RDONLY | fs.constants.O_NOFOLLOW | fs.constants.O_NONBLOCK);
+  } catch (err) {
+    const code = (err as NodeJS.ErrnoException).code;
+    if (code === 'ENOENT') return failed(`File not found: ${filePath}`);
+    // O_NOFOLLOW refuses a link as ELOOP.
+    if (code === 'ELOOP') return failed(refusal(filePath, 'a link'));
+    return failed(`Failed to read file: ${(err as Error).message}`);
   }
 
   let content: string;
   try {
-    content = fs.readFileSync(filePath, 'utf-8');
+    const problem = notRegularFile(filePath, fs.fstatSync(fd));
+    if (problem) return failed(problem);
+    content = fs.readFileSync(fd, 'utf-8');
   } catch (err) {
-    return {
-      success: false,
-      errors: [{ message: `Failed to read file: ${(err as Error).message}` }],
-      warnings: [],
-    };
+    return failed(`Failed to read file: ${(err as Error).message}`);
+  } finally {
+    fs.closeSync(fd);
   }
 
   return parseLocalmostrcContent(content);
@@ -119,9 +271,6 @@ export function effectivePolicyLevel(config?: LocalmostrcConfig | null): Sandbox
 }
 
 export function parseLocalmostrcContent(content: string): ParseResult {
-  const errors: ParseError[] = [];
-  const warnings: string[] = [];
-
   let parsed: unknown;
   try {
     parsed = yaml.load(content);
@@ -140,6 +289,20 @@ export function parseLocalmostrcContent(content: string): ParseResult {
     };
   }
 
+  return validateLocalmostrc(parsed);
+}
+
+/**
+ * Validate an already-parsed policy against the grammar.
+ *
+ * Separate from parsing so a policy read back from anywhere else - the
+ * approval cache, which is JSON - is held to exactly the grammar the
+ * repository's file was, rather than trusted for having been written by us.
+ */
+export function validateLocalmostrc(parsed: unknown): ParseResult {
+  const errors: ParseError[] = [];
+  const warnings: string[] = [];
+
   if (!parsed || typeof parsed !== 'object' || Array.isArray(parsed)) {
     return {
       success: false,
@@ -149,6 +312,17 @@ export function parseLocalmostrcContent(content: string): ParseResult {
   }
 
   const config = parsed as Record<string, unknown>;
+
+  // Closed at the top as each section is: a key nobody parses grants nothing
+  // while reading as though it decides something, and a key a later version
+  // adds would otherwise be approved here without being shown. The list is
+  // shared with what describes a policy, whose guard test covers it.
+  for (const key of Object.keys(config)) {
+    if ((LOCALMOSTRC_KEYS as readonly string[]).includes(key)) continue;
+    errors.push({
+      message: `"${key}" is not a .localmostrc key. Accepted keys: ${LOCALMOSTRC_KEYS.join(', ')}.`,
+    });
+  }
 
   // Validate version
   if (config.version === undefined) {
@@ -170,7 +344,7 @@ export function parseLocalmostrcContent(content: string): ParseResult {
 
   // Validate shared policy
   if (config.shared !== undefined) {
-    validatePolicy(config.shared, 'shared', errors);
+    validatePolicy(config.shared, 'shared', errors, 'shared', warnings);
   }
 
   // Validate per-workflow policies
@@ -180,7 +354,7 @@ export function parseLocalmostrcContent(content: string): ParseResult {
     } else {
       for (const [workflowName, policy] of Object.entries(config.workflows as Record<string, unknown>)) {
         // A workflow may also require secrets; the shared scope may not.
-        validatePolicy(policy, `workflows.${workflowName}`, errors, WORKFLOW_POLICY_KEYS);
+        validatePolicy(policy, `workflows.${workflowName}`, errors, 'workflow', warnings);
         validateSecretsPolicy(policy, `workflows.${workflowName}`, errors);
       }
     }
@@ -191,11 +365,14 @@ export function parseLocalmostrcContent(content: string): ParseResult {
   }
 
   // Build a properly typed config object
+  const workflows = config.workflows as Record<string, unknown> | undefined;
   const typedConfig: LocalmostrcConfig = {
     version: typeof config.version === 'number' ? config.version : LOCALMOSTRC_VERSION,
     level: config.level as SandboxPolicyLevel | undefined,
-    shared: config.shared as SandboxPolicy | undefined,
-    workflows: config.workflows as Record<string, WorkflowPolicy> | undefined,
+    shared: withoutIgnoredKeys(config.shared) as SharedPolicy | undefined,
+    workflows: workflows
+      ? (Object.fromEntries(Object.entries(workflows).map(([name, policy]) => [name, withoutIgnoredKeys(policy)])) as Record<string, WorkflowPolicy>)
+      : undefined,
   };
 
   return {
@@ -206,15 +383,24 @@ export function parseLocalmostrcContent(content: string): ParseResult {
   };
 }
 
+/** A policy section without the keys that are ignored; anything else as it was. */
+function withoutIgnoredKeys(policy: unknown): unknown {
+  if (typeof policy !== 'object' || policy === null) return policy;
+  const kept = { ...(policy as Record<string, unknown>) };
+  for (const key of Object.keys(IGNORED_POLICY_KEYS)) delete kept[key];
+  if (typeof kept.network === 'object' && kept.network !== null) {
+    const network = { ...(kept.network as Record<string, unknown>) };
+    for (const key of Object.keys(IGNORED_NETWORK_KEYS)) delete network[key];
+    kept.network = network;
+  }
+  return kept;
+}
+
 /**
  * Validate a sandbox policy object.
  */
-function validatePolicy(
-  policy: unknown,
-  path: string,
-  errors: ParseError[],
-  accepted: readonly string[] = POLICY_SECTION_KEYS
-): void {
+function validatePolicy(policy: unknown, path: string, errors: ParseError[], scope: PolicyScope, warnings: string[]): void {
+  const accepted: readonly string[] = scope === 'workflow' ? WORKFLOW_POLICY_KEYS : POLICY_SECTION_KEYS;
   if (policy === null || policy === undefined) {
     return; // Empty policy is valid
   }
@@ -233,6 +419,10 @@ function validatePolicy(
   for (const key of Object.keys(p)) {
     if (accepted.includes(key)) continue;
     if (key === 'sockets') continue; // Has its own message, below.
+    if (Object.hasOwn(IGNORED_POLICY_KEYS, key)) {
+      warnings.push(`${path}.${key} is ignored: ${IGNORED_POLICY_KEYS[key]}.`);
+      continue;
+    }
     errors.push({
       message: `${path}.${key} is not a policy key. Accepted keys: ${accepted.join(', ')}.`,
     });
@@ -240,7 +430,7 @@ function validatePolicy(
 
   // Validate network policy
   if (p.network !== undefined) {
-    validateNetworkPolicy(p.network, `${path}.network`, errors);
+    validateNetworkPolicy(p.network, `${path}.network`, errors, warnings);
   }
 
   // Validate filesystem policy
@@ -271,20 +461,72 @@ function validatePolicy(
   }
 }
 
-function validateNetworkPolicy(policy: unknown, path: string, errors: ParseError[]): void {
+function validateNetworkPolicy(policy: unknown, path: string, errors: ParseError[], warnings: string[]): void {
   if (typeof policy !== 'object' || policy === null) {
     errors.push({ message: `${path} must be an object` });
     return;
   }
 
-  const p = policy as Record<string, unknown>;
+  const p = { ...(policy as Record<string, unknown>) };
+  for (const key of Object.keys(IGNORED_NETWORK_KEYS)) {
+    if (!Object.hasOwn(p, key)) continue;
+    warnings.push(`${path}.${key} is ignored: ${IGNORED_NETWORK_KEYS[key]}.`);
+    delete p[key];
+  }
+  refuseUnknownKeys(p, path, POLICY_SECTION_SUBKEYS.network, errors);
 
   if (p.allow !== undefined) {
-    validateStringArray(p.allow, `${path}.allow`, errors);
+    validateHostPatternArray(p.allow, `${path}.allow`, errors);
   }
   if (p.deny !== undefined) {
-    validateStringArray(p.deny, `${path}.deny`, errors);
+    validateHostPatternArray(p.deny, `${path}.deny`, errors);
   }
+}
+
+/**
+ * Why a network entry is not one the proxies can match, or null when it is.
+ * The proxies read an entry with parseHostPattern: a host name, an IP address
+ * or a *.domain wildcard, optionally followed by :port (an IPv6 address takes
+ * one only in brackets), and nothing else. Read that way, "https://evil.com"
+ * is a host "https" with a port that is not one and " evil.com" a name no
+ * connection has, so each allowed or denied nothing while reading as though
+ * it did. Case is ignored.
+ *
+ * A host must also be in the spelling a request's host arrives in - ASCII
+ * (punycode for an international name), an address written out, no trailing
+ * dot - since an allow entry spelled otherwise never matches one. A deny
+ * entry is compared in that spelling whatever it is written in (see
+ * denyForm), and is held to it all the same, so the two lists read alike.
+ * The message gives the entry to write, wildcard and port kept.
+ */
+export function hostPatternProblem(entry: string): string | null {
+  const pattern = parseHostPattern(entry);
+  const host = pattern.wildcard ? pattern.host.slice(1) : pattern.host;
+  const canonical = pattern.port === null ? null : canonicalHost(host)?.replace(/\.+$/, '') ?? null;
+  const isAddress = canonical !== null && net.isIP(canonical) !== 0;
+  const isName = canonical !== null && canonical.split('.').every((label) => /^[a-z0-9_-]{1,63}$/.test(label));
+  // canonicalHost reads a host the way a URL does, ending it at the first of
+  // these and dropping a tab or line break, so the spelling offered below for
+  // "10.0.0.0/8" would be one address rather than the range, for
+  // "evil.com/path" a whole host, and for "evil.com\tx" another host.
+  const urlSyntax = /[/?#\\\t\n\r]/.test(host);
+  if (canonical === null || urlSyntax || (pattern.wildcard ? !isName || isAddress : !isName && !isAddress)) {
+    return 'must be a host, an IP address or *.domain, optionally with :port, and nothing else';
+  }
+  if (canonical === host) return null;
+  const port = pattern.port === undefined ? '' : `:${pattern.port}`;
+  const spelled = net.isIP(canonical) === 6 && port ? `[${canonical}]` : canonical;
+  return `is not in the spelling a request's host arrives in: write ${JSON.stringify(`${pattern.wildcard ? '*.' : ''}${spelled}${port}`)} instead`;
+}
+
+function validateHostPatternArray(value: unknown, path: string, errors: ParseError[]): void {
+  validateStringArray(value, path, errors);
+  if (!Array.isArray(value)) return;
+  value.forEach((entry, i) => {
+    if (typeof entry !== 'string') return;
+    const problem = hostPatternProblem(entry);
+    if (problem) errors.push({ message: `${path}[${i}] ${problem}` });
+  });
 }
 
 function validateFilesystemPolicy(policy: unknown, path: string, errors: ParseError[]): void {
@@ -294,15 +536,25 @@ function validateFilesystemPolicy(policy: unknown, path: string, errors: ParseEr
   }
 
   const p = policy as Record<string, unknown>;
+  refuseUnknownKeys(p, path, POLICY_SECTION_SUBKEYS.filesystem, errors);
 
   if (p.read !== undefined) {
-    validateStringArray(p.read, `${path}.read`, errors);
+    validatePathArray(p.read, `${path}.read`, errors);
   }
   if (p.write !== undefined) {
-    validateStringArray(p.write, `${path}.write`, errors);
+    validatePathArray(p.write, `${path}.write`, errors);
   }
   if (p.deny !== undefined) {
-    validateStringArray(p.deny, `${path}.deny`, errors);
+    validatePathArray(p.deny, `${path}.deny`, errors);
+    // A deny is matched against absolute paths only, so a relative one
+    // would be shown as denying something and deny nothing. Unlike a grant,
+    // which is no worse for granting nothing.
+    if (Array.isArray(p.deny)) {
+      p.deny.forEach((entry, i) => {
+        if (typeof entry !== 'string' || entry === '~' || entry.startsWith('~/') || entry.startsWith('/')) return;
+        errors.push({ message: `${path}.deny[${i}] must be an absolute path or start with ~/: a relative deny is never applied` });
+      });
+    }
   }
 }
 
@@ -313,12 +565,30 @@ function validateEnvPolicy(policy: unknown, path: string, errors: ParseError[]):
   }
 
   const p = policy as Record<string, unknown>;
+  refuseUnknownKeys(p, path, POLICY_SECTION_SUBKEYS.env, errors);
 
   if (p.allow !== undefined) {
     validateStringArray(p.allow, `${path}.allow`, errors);
   }
   if (p.deny !== undefined) {
     validateStringArray(p.deny, `${path}.deny`, errors);
+  }
+}
+
+/**
+ * Refuse a key inside a section that the grammar does not define, for the
+ * same reason validatePolicy refuses one at the section level: nothing
+ * parses it, so it grants or protects nothing while reading as though it did.
+ */
+function refuseUnknownKeys(
+  section: Record<string, unknown>,
+  path: string,
+  accepted: readonly string[],
+  errors: ParseError[]
+): void {
+  for (const key of Object.keys(section)) {
+    if (accepted.includes(key)) continue;
+    errors.push({ message: `${path}.${key} is not a policy key. Accepted keys: ${accepted.join(', ')}.` });
   }
 }
 
@@ -338,6 +608,7 @@ function validateSecretsPolicy(policy: unknown, path: string, errors: ParseError
   }
 
   const s = p.secrets as Record<string, unknown>;
+  refuseUnknownKeys(s, `${path}.secrets`, POLICY_SECTION_SUBKEYS.secrets, errors);
   if (s.require !== undefined) {
     validateStringArray(s.require, `${path}.secrets.require`, errors);
   }
@@ -352,6 +623,33 @@ function validateStringArray(value: unknown, path: string, errors: ParseError[])
   for (let i = 0; i < value.length; i++) {
     if (typeof value[i] !== 'string') {
       errors.push({ message: `${path}[${i}] must be a string` });
+    }
+  }
+}
+
+/**
+ * A filesystem path from a policy, which names what a job's macOS VM is to
+ * be given once VM shares exist. A quote, a backslash or a control character
+ * (a newline especially) occurs in no real macOS path, and could change what
+ * the line it is written into says, so they are refused rather than
+ * escaped-and-hoped: the user approves what a policy says, and it must not
+ * be able to grant something else.
+ */
+function validatePathArray(value: unknown, path: string, errors: ParseError[]): void {
+  validateStringArray(value, path, errors);
+  if (!Array.isArray(value)) return;
+  for (let i = 0; i < value.length; i++) {
+    const entry = value[i];
+    if (typeof entry !== 'string') continue;
+    if (/["\\\x00-\x1f\x7f]/.test(entry)) {
+      errors.push({ message: `${path}[${i}] must not contain quotes, backslashes or control characters` });
+    }
+    // No ".." traversal. A relative path is a legitimate workspace path
+    // (./build, ./Pods), resolved from the worker's own directory - but a ".."
+    // segment could climb out of the workspace into the app's runner
+    // directory (proxy credentials, pids, other workers').
+    if (entry.split('/').includes('..')) {
+      errors.push({ message: `${path}[${i}] must not contain ".." path segments` });
     }
   }
 }
@@ -377,7 +675,10 @@ function mergeArrays(base?: string[], override?: string[]): string[] | undefined
 /**
  * Merge network policies.
  */
-function mergeNetworkPolicy(base?: NetworkPolicy, override?: NetworkPolicy): NetworkPolicy | undefined {
+function mergeNetworkPolicy(
+  base?: NetworkPolicy,
+  override?: NetworkPolicy
+): NetworkPolicy | undefined {
   if (!base && !override) {
     return undefined;
   }
@@ -427,7 +728,7 @@ function mergeEnvPolicy(base?: EnvPolicy, override?: EnvPolicy): EnvPolicy | und
  * Merge two sandbox policies.
  * Override takes precedence, arrays are merged.
  */
-export function mergePolicies(base: SandboxPolicy, override: SandboxPolicy): SandboxPolicy {
+export function mergePolicies(base: SharedPolicy, override: PolicyRules): SharedPolicy {
   return {
     network: mergeNetworkPolicy(base.network, override.network),
     filesystem: mergeFilesystemPolicy(base.filesystem, override.filesystem),
@@ -440,7 +741,7 @@ export function mergePolicies(base: SandboxPolicy, override: SandboxPolicy): San
  * Get the effective policy for a specific workflow.
  * Merges shared policy with workflow-specific overrides.
  */
-export function getEffectivePolicy(config: LocalmostrcConfig, workflowName: string): SandboxPolicy {
+export function getEffectivePolicy(config: LocalmostrcConfig, workflowName: string): SharedPolicy {
   const shared = config.shared || {};
   const workflowPolicy = config.workflows?.[workflowName] || {};
 
@@ -460,6 +761,14 @@ export function getRequiredSecrets(config: LocalmostrcConfig, workflowName: stri
 
 /**
  * Generate a .localmostrc file from a config object.
+ *
+ * `localmost test --updaterc` writes a repository's whole policy back
+ * through this, so it must reproduce every key the parser accepts, each
+ * value exactly. Strings are always quoted - an env pattern such as
+ * `*_TOKEN` would otherwise open a YAML alias - and a section with nothing
+ * in it is left out rather than written as a bare key, which YAML reads as
+ * null and the parser refuses. It writes the parsed config, so comments in
+ * a hand-written file are not kept.
  */
 export function serializeLocalmostrc(config: LocalmostrcConfig): string {
   const lines: string[] = [];
@@ -471,8 +780,7 @@ export function serializeLocalmostrc(config: LocalmostrcConfig): string {
   lines.push('');
 
   if (config.shared) {
-    lines.push('shared:');
-    lines.push(...serializePolicy(config.shared, '  '));
+    lines.push(...serializeBlock('shared', serializePolicy(config.shared, '  ')));
   }
 
   if (config.workflows && Object.keys(config.workflows).length > 0) {
@@ -480,81 +788,73 @@ export function serializeLocalmostrc(config: LocalmostrcConfig): string {
     lines.push('workflows:');
 
     for (const [name, policy] of Object.entries(config.workflows)) {
-      lines.push(`  ${name}:`);
-      lines.push(...serializePolicy(policy, '    '));
-
-      if (policy.secrets?.require?.length) {
-        lines.push('    secrets:');
-        lines.push('      require:');
-        for (const secret of policy.secrets.require) {
-          lines.push(`        - ${secret}`);
-        }
-      }
+      const body = serializePolicy(policy, '    ');
+      body.push(...serializeSection('secrets', serializeList('require', policy.secrets?.require, '      '), '    '));
+      lines.push(...serializeBlock(yamlKey(name), body, '  '));
     }
   }
 
   return lines.join('\n') + '\n';
 }
 
-function serializePolicy(policy: SandboxPolicy, indent: string): string[] {
+/** Quote a string for YAML, as serializeDockerPolicy does. */
+const quote = (value: string): string => JSON.stringify(value);
+
+/**
+ * A workflow name as a mapping key: bare only when it is plain characters
+ * and YAML reads it back as the same string, quoted otherwise - a `: ` or
+ * ` #` in a name would end the key early, and a name such as `1.0`, `True`
+ * or `null` would come back as a different key.
+ */
+function yamlKey(name: string): string {
+  return /^[A-Za-z0-9_][A-Za-z0-9_.-]*$/.test(name) && yaml.load(name) === name ? name : quote(name);
+}
+
+/** A policy block: `key:` over its body, or `key: {}` when it has none. */
+function serializeBlock(key: string, body: string[], indent = ''): string[] {
+  return body.length > 0 ? [`${indent}${key}:`, ...body] : [`${indent}${key}: {}`];
+}
+
+/** A section inside a policy: `key:` over its body, or nothing when it has none. */
+function serializeSection(key: string, body: string[], indent: string): string[] {
+  return body.length > 0 ? [`${indent}${key}:`, ...body] : [];
+}
+
+/** A list of strings under `key:`, or nothing when it is empty. */
+function serializeList(key: string, items: readonly string[] | undefined, indent: string): string[] {
+  if (!items?.length) return [];
+  return [`${indent}${key}:`, ...items.map((item) => `${indent}  - ${quote(item)}`)];
+}
+
+function serializePolicy(policy: SharedPolicy, indent: string): string[] {
   const lines: string[] = [];
+  const inner = `${indent}  `;
 
   if (policy.docker) {
     lines.push(...serializeDockerPolicy(policy.docker, indent));
   }
 
   if (policy.network) {
-    lines.push(`${indent}network:`);
-    if (policy.network.allow?.length) {
-      lines.push(`${indent}  allow:`);
-      for (const domain of policy.network.allow) {
-        lines.push(`${indent}    - "${domain}"`);
-      }
-    }
-    if (policy.network.deny?.length) {
-      lines.push(`${indent}  deny:`);
-      for (const domain of policy.network.deny) {
-        lines.push(`${indent}    - "${domain}"`);
-      }
-    }
+    const { allow, deny } = policy.network;
+    const body = [...serializeList('allow', allow, inner), ...serializeList('deny', deny, inner)];
+    lines.push(...serializeSection('network', body, indent));
   }
 
   if (policy.filesystem) {
-    lines.push(`${indent}filesystem:`);
-    if (policy.filesystem.read?.length) {
-      lines.push(`${indent}  read:`);
-      for (const path of policy.filesystem.read) {
-        lines.push(`${indent}    - "${path}"`);
-      }
-    }
-    if (policy.filesystem.write?.length) {
-      lines.push(`${indent}  write:`);
-      for (const path of policy.filesystem.write) {
-        lines.push(`${indent}    - "${path}"`);
-      }
-    }
-    if (policy.filesystem.deny?.length) {
-      lines.push(`${indent}  deny:`);
-      for (const path of policy.filesystem.deny) {
-        lines.push(`${indent}    - "${path}"`);
-      }
-    }
+    const { read, write, deny } = policy.filesystem;
+    lines.push(...serializeSection('filesystem', [
+      ...serializeList('read', read, inner),
+      ...serializeList('write', write, inner),
+      ...serializeList('deny', deny, inner),
+    ], indent));
   }
 
   if (policy.env) {
-    lines.push(`${indent}env:`);
-    if (policy.env.allow?.length) {
-      lines.push(`${indent}  allow:`);
-      for (const name of policy.env.allow) {
-        lines.push(`${indent}    - ${name}`);
-      }
-    }
-    if (policy.env.deny?.length) {
-      lines.push(`${indent}  deny:`);
-      for (const name of policy.env.deny) {
-        lines.push(`${indent}    - ${name}`);
-      }
-    }
+    const { allow, deny } = policy.env;
+    lines.push(...serializeSection('env', [
+      ...serializeList('allow', allow, inner),
+      ...serializeList('deny', deny, inner),
+    ], indent));
   }
 
   return lines;
@@ -604,8 +904,8 @@ export function diffConfigs(oldConfig: LocalmostrcConfig, newConfig: Localmostrc
 }
 
 function diffPolicies(
-  oldPolicy: SandboxPolicy,
-  newPolicy: SandboxPolicy,
+  oldPolicy: SharedPolicy,
+  newPolicy: SharedPolicy,
   prefix: string,
   diffs: PolicyDiff[]
 ): void {

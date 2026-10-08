@@ -2,10 +2,12 @@ import React, { useState, useEffect } from 'react';
 import { FontAwesomeIcon } from '@fortawesome/react-fontawesome';
 import { faXmark, faLightbulb, faMoon, faDesktop } from '@fortawesome/free-solid-svg-icons';
 import { SleepProtection, BatteryPauseThreshold, SANDBOX_POLICY_LEVEL_DESCRIPTIONS } from '../../shared/types';
+import { ResourcePauseConfig } from '../../shared/job-preferences';
 import { GITHUB_APP_SETTINGS_URL, PRIVACY_POLICY_URL, REPOSITORY_URL } from '../../shared/constants';
 import { useAppConfig, useRunner, useUpdate } from '../contexts';
 import UserFilterSettings from './UserFilterSettings';
 import PolicyApprovals from './PolicyApprovals';
+import MacVmSetup from './MacVmSetup';
 import styles from './SettingsPage.module.css';
 import shared from '../styles/shared.module.css';
 
@@ -32,10 +34,6 @@ const SettingsPage: React.FC<SettingsPageProps> = ({ onBack, scrollToSection, on
     setLogLevel,
     runnerLogLevel,
     setRunnerLogLevel,
-    preserveWorkDir,
-    setPreserveWorkDir,
-    toolCacheLocation,
-    setToolCacheLocation,
     userFilter,
     setUserFilter,
     power,
@@ -44,6 +42,8 @@ const SettingsPage: React.FC<SettingsPageProps> = ({ onBack, scrollToSection, on
     notifications,
     setNotifyOnPause,
     setNotifyOnJobEvents,
+    resourcePause,
+    setResourcePauseRunningJobs,
   } = useAppConfig();
 
   // Runner state from context
@@ -53,6 +53,8 @@ const SettingsPage: React.FC<SettingsPageProps> = ({ onBack, scrollToSection, on
     deviceCode,
     login,
     logout,
+    authExpired,
+    refreshAuthExpiry,
     isDownloaded,
     runnerVersion,
     availableVersions,
@@ -74,6 +76,7 @@ const SettingsPage: React.FC<SettingsPageProps> = ({ onBack, scrollToSection, on
 
   // Local UI state
   const [showSleepConsentDialog, setShowSleepConsentDialog] = useState(false);
+  const [isReconnecting, setIsReconnecting] = useState(false);
   const [pendingSleepSetting, setPendingSleepSetting] = useState<SleepProtection | null>(null);
   const [avatarError, setAvatarError] = useState(false);
   const [launchAtLogin, setLaunchAtLogin] = useState(false);
@@ -217,6 +220,53 @@ const SettingsPage: React.FC<SettingsPageProps> = ({ onBack, scrollToSection, on
                   @{user.login}
                 </a>
               </div>
+              {authExpired && deviceCode && (
+                // Reconnect starts the device flow from here, so the code has
+                // to be shown here too: the panel below lives in the
+                // signed-out branch, which an expired session never reaches.
+                // Without this the browser opened and asked for a code the
+                // app never displayed.
+                <div className={styles.codeWithCopied}>
+                  <code className={styles.userCodeSmall}>{deviceCode.userCode}</code>
+                  {showCopiedNotice && <span className={styles.copiedBadge}>Copied!</span>}
+                  <button
+                    className={shared.btnSecondary}
+                    onClick={() => window.localmost.github.cancelAuth()}
+                  >
+                    Cancel
+                  </button>
+                </div>
+              )}
+
+              {authExpired && !deviceCode && (
+                // Additive: the account still renders exactly as before, with
+                // a badge and a way out beside it. Nothing about what the app
+                // considers its auth state changes.
+                <>
+                  <span className={styles.expiredNotice}>Session expired</span>
+                  <button
+                    className={shared.btnPrimary}
+                    disabled={isReconnecting}
+                    onClick={async () => {
+                      setIsReconnecting(true);
+                      try {
+                        // A refresh first: the session may simply have been
+                        // re-authorised, and then nothing is asked of them.
+                        const { recovered } = await window.localmost.github.reconnect();
+                        if (!recovered) await handleLogin();
+                        // The flag is read when the provider mounts, so
+                        // without this the badge outlived the fix and the app
+                        // had to be quit and reopened.
+                        await refreshAuthExpiry();
+                      } finally {
+                        setIsReconnecting(false);
+                      }
+                    }}
+                  >
+                    {isReconnecting ? 'Reconnecting...' : 'Reconnect'}
+                  </button>
+                </>
+              )}
               <button className={shared.btnSecondary} onClick={logout}>
                 Sign Out
               </button>
@@ -395,36 +445,8 @@ const SettingsPage: React.FC<SettingsPageProps> = ({ onBack, scrollToSection, on
                 <span className={styles.parallelismValue}>{runnerConfig.runnerCount} runner{runnerConfig.runnerCount > 1 ? 's' : ''}</span>
               </div>
               <p className={shared.formHint}>
-                Maximum concurrent jobs across all targets.
-              </p>
-            </div>
-
-            <div className={shared.formGroup}>
-              <label>Tool cache</label>
-              <select
-                value={toolCacheLocation}
-                onChange={(e) => setToolCacheLocation(e.target.value as 'persistent' | 'per-sandbox')}
-              >
-                <option value="persistent">Persistent (recommended)</option>
-                <option value="per-sandbox">Per-sandbox</option>
-              </select>
-              <p className={shared.formHint}>
-                Persistent caches tools like Node.js across restarts. Per-sandbox rebuilds each time (slower but cleaner).
-              </p>
-            </div>
-
-            <div className={shared.formGroup}>
-              <label>Cache work directory</label>
-              <select
-                value={preserveWorkDir}
-                onChange={(e) => setPreserveWorkDir(e.target.value as 'never' | 'session' | 'always')}
-              >
-                <option value="never">Never (recommended)</option>
-                <option value="session">During session</option>
-                <option value="always">Always</option>
-              </select>
-              <p className={shared.formHint}>
-                Preserve workflow _work directory to cache dependencies like node_modules. "During session" clears on app start/quit.
+                Maximum concurrent jobs across all targets. Each job runs in a macOS VM, and a Mac runs at most two
+                at once (one with less than 16 GB of memory); jobs beyond that stay queued on GitHub until a VM is free.
               </p>
             </div>
           </section>
@@ -441,15 +463,14 @@ const SettingsPage: React.FC<SettingsPageProps> = ({ onBack, scrollToSection, on
               <PolicyApprovals />
             </div>
 
-            {/* Sandbox Policy Subsection */}
+            {/* Network Policy Subsection */}
             <div className={styles.subsection}>
-              <h4>Sandbox Policy</h4>
+              <h4>Network Policy</h4>
               <p className={shared.formHint}>
-                Each repository declares its own policy level in its{' '}
-                <code>.localmostrc</code>, alongside the hosts and paths it
-                needs. A repository that declares none runs strict. Changing the
-                level is a policy change like any other, so it appears in the
-                approval above before it takes effect.
+                Each job runs in a macOS VM whose only way out is its own proxy. Each repository declares in its{' '}
+                <code>.localmostrc</code> the hosts its jobs need and a policy level, which sets what the proxy lets
+                through besides; a repository that declares none runs strict. Changing either is a policy change like
+                any other, so it appears in the approval above before it takes effect.
               </p>
               <ul className={shared.formHint}>
                 {(['strict', 'moderate', 'permissive'] as const).map((level) => (
@@ -473,6 +494,16 @@ const SettingsPage: React.FC<SettingsPageProps> = ({ onBack, scrollToSection, on
             </div>
           </section>
         )}
+
+        {/* macOS VM Section */}
+        <section id="macos-vm-section" className={styles.settingsSection} data-testid="settings-section">
+          <h3>macOS VM</h3>
+          <p className={shared.formHint}>
+            Every job runs in a fresh macOS VM cloned from a golden image, and the VM is thrown away when the job
+            ends. The runner takes no jobs until the image is ready.
+          </p>
+          <MacVmSetup />
+        </section>
 
         {/* Power Section */}
         <section id="power-section" className={styles.settingsSection} data-testid="settings-section">
@@ -518,6 +549,21 @@ const SettingsPage: React.FC<SettingsPageProps> = ({ onBack, scrollToSection, on
             </label>
             <p className={shared.formHint}>
               Detects camera usage and pauses runners during video calls. Resumes 60 seconds after the call ends.
+            </p>
+          </div>
+          <div className={shared.formGroup}>
+            <label htmlFor="resource-pause-running-jobs">Running jobs when a pause begins</label>
+            <select
+              id="resource-pause-running-jobs"
+              value={resourcePause.runningJobs}
+              onChange={(e) => setResourcePauseRunningJobs(e.target.value as ResourcePauseConfig['runningJobs'])}
+            >
+              <option value="finish">Let them finish</option>
+              <option value="stop">Stop them</option>
+            </select>
+            <p className={shared.formHint}>
+              Either way the runner takes no new job while paused. Stopping them stops the workers at once, and
+              their jobs fail on GitHub. Applies from the next pause.
             </p>
           </div>
         </section>
@@ -651,6 +697,9 @@ const SettingsPage: React.FC<SettingsPageProps> = ({ onBack, scrollToSection, on
               <option value="warn">Warning</option>
               <option value="error">Error</option>
             </select>
+            <p className={shared.formHint}>
+              At Debug, with the localmost log level also at Debug, the runner's diagnostic trace (job names, runner URLs) is written to ~/.localmost/logs.
+            </p>
           </div>
         </section>
 

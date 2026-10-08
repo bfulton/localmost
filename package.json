@@ -11,7 +11,7 @@
   },
   "main": "build/dist/main.js",
   "engines": {
-    "node": ">=22.12.0"
+    "node": ">=22.15.0"
   },
   "bin": {
     "localmost": "./build/dist/cli.js"
@@ -22,11 +22,16 @@
     "build": "npm run prebuild && cross-env NODE_ENV=production webpack --config webpack.config.js && npm run build:cli",
     "build:cli": "cross-env NODE_ENV=production webpack --config webpack.config.cli.js && chmod +x build/dist/cli.js",
     "build:dev": "cross-env NODE_ENV=development webpack --config webpack.config.js",
+    "build:native": "npm run build:helper && npm run build:macvm && npm run build:guest && npm run fetch:docker-cli",
+    "fetch:docker-cli": "node scripts/fetch-docker-cli.mjs",
     "watch": "cross-env NODE_ENV=development webpack --config webpack.config.js --watch",
-    "package": "npm run build && electron-forge package",
-    "make": "npm run build && electron-forge make",
+    "package": "npm run build && electron-forge package --arch=arm64",
+    "make": "npm run build && electron-forge make --arch=arm64",
     "prebuild": "npm run icons && npm run build-info",
     "build-info": "node scripts/generate-build-info.js",
+    "build:guest": "node scripts/guest/build-guest.js",
+    "build:helper": "node scripts/build-helper.mjs",
+    "build:macvm": "node scripts/build-macvm.mjs",
     "lint": "eslint src --ext .ts,.tsx",
     "pretypecheck": "npm run build-info",
     "typecheck": "tsc --noEmit -p tsconfig.json",
@@ -56,7 +61,7 @@
     "@testing-library/react": "^16.0.1",
     "@types/jest": "^29.5.14",
     "@types/js-yaml": "^4.0.9",
-    "@types/node": "^20.11.0",
+    "@types/node": "^22.15.0",
     "@types/react": "^18.2.48",
     "@types/react-dom": "^18.2.18",
     "@typescript-eslint/eslint-plugin": "^8.50.0",
@@ -74,7 +79,7 @@
     "jest": "^29.7.0",
     "jest-environment-jsdom": "^29.7.0",
     "mini-css-extract-plugin": "^2.9.0",
-    "sharp": "^0.35.3",
+    "sharp": "^0.35.4",
     "source-map-explorer": "^2.5.3",
     "ts-jest": "^29.2.5",
     "ts-loader": "^9.5.1",
@@ -90,7 +95,7 @@
     "@fortawesome/react-fontawesome": "^3.1.1",
     "@zubridge/electron": "^2.1.1",
     "is-camera-on": "^4.0.0",
-    "js-yaml": "^4.1.1",
+    "js-yaml": "^4.3.2",
     "react": "^18.2.0",
     "react-dom": "^18.2.0",
     "tar": "^7.5.22",
@@ -102,6 +107,7 @@
     "brace-expansion@1": "^1.1.18",
     "minimatch@3": "^3.1.5",
     "tmp": "^0.2.6",
-    "extract-zip": "npm:@electron-internal/extract-zip@^1.0.5"
+    "extract-zip": "npm:@electron-internal/extract-zip@^1.0.5",
+    "js-yaml@3": "^3.15.2"
   }
 }

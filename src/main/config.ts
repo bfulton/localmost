@@ -8,7 +8,17 @@ import * as yaml from 'js-yaml';
 import { getAppDataDir, getConfigPath } from './paths';
 import { encryptValue, decryptValue } from './encryption';
 import { bootLog } from './log-file';
-import { GitHubUser, SleepProtection, LogLevel, UserFilterConfig, Target, PowerConfig, NotificationsConfig, UpdateSettings } from '../shared/types';
+import {
+  GitHubUser,
+  SleepProtection,
+  LogLevel,
+  UserFilterConfig,
+  Target,
+  PowerConfig,
+  NotificationsConfig,
+  UpdateSettings,
+} from '../shared/types';
+import type { ResourcePauseConfig } from '../shared/job-preferences';
 
 // Config paths - uses centralized path management
 const configDir = getAppDataDir();
@@ -32,7 +42,9 @@ export const isConfigFromNewerBuild = (version: unknown): boolean =>
 /**
  * Keys that can be set via the SETTINGS_SET IPC handler.
  * This is the source of truth - TypeScript derives the type from this array.
- * Note: 'auth' and 'githubClientId' are intentionally excluded (set via auth flow).
+ * Note: 'auth' and 'githubClientId' are intentionally excluded (set via auth flow),
+ * and so is 'targets': only the target manager writes them, after checking
+ * each name, and the renderer only ever echoed back what it had read.
  */
 export const SETTABLE_CONFIG_KEYS = [
   'runnerConfig',
@@ -43,10 +55,10 @@ export const SETTABLE_CONFIG_KEYS = [
   'logLevel',
   'runnerLogLevel',
   'userFilter',
-  'targets',
   'maxConcurrentJobs',
   'power',  // Power settings (battery/video call pausing)
   'notifications',
+  'resourcePause',  // What a resource pause does to running jobs
 ] as const;
 
 export type SettableConfigKey = typeof SETTABLE_CONFIG_KEYS[number];
@@ -60,6 +72,8 @@ export interface AppConfig {
     refreshToken?: string;
     expiresAt?: number;  // Unix timestamp (ms) when access token expires
     user: GitHubUser;
+    /** The refresh token is spent: the session is known but unusable. */
+    expired?: boolean;
   };
   runnerConfig?: {
     level: 'repo' | 'org';
@@ -75,7 +89,6 @@ export interface AppConfig {
   sleepProtection?: SleepProtection;
   logLevel?: LogLevel;
   runnerLogLevel?: LogLevel;
-  preserveWorkDir?: 'always' | 'never';
   userFilter?: UserFilterConfig;
   /** Sandbox policy level for all restrictions. Defaults to 'strict' */
   /** Auto-update preferences */
@@ -88,6 +101,154 @@ export interface AppConfig {
   power?: PowerConfig;
   /** Notification settings */
   notifications?: NotificationsConfig;
+  /** The per-job Docker VMs; read from config.yaml only, see resolveDockerVmConfig. */
+  dockerVm?: Partial<Record<keyof DockerVmConfig, unknown>>;
+  /** What a resource pause does; see ResourcePauseConfig and resolveResourcePauseConfig. */
+  resourcePause?: Partial<Record<keyof ResourcePauseConfig, unknown>>;
+}
+
+// The resource-pause preferences, with their defaults and resolver, live in
+// shared/job-preferences, where the Settings page reads them too.
+export { DEFAULT_RESOURCE_PAUSE_CONFIG, resolveResourcePauseConfig } from '../shared/job-preferences';
+export type { ResourcePauseConfig } from '../shared/job-preferences';
+
+/**
+ * The per-job Docker VMs, as used: every key present, in range. See
+ * docs/roadmap/vm-docker-backend-contract.md §5.6. No key enables a fallback
+ * daemon; there is none.
+ */
+export interface DockerVmConfig {
+  /** Boot one spare VM for the next spawned worker: memory for latency. */
+  prewarm: boolean;
+  /** Per VM. */
+  cpus: number;
+  /** Per VM; committed lazily, returned only when the VM stops. */
+  memoryMiB: number;
+  /** How many VMs may run at once; more wait at the admission gate. */
+  maxRunning: number;
+  /** Every VM's sparse data disk, the golden disk's size; and the most free space set aside for one. */
+  dataDiskGiB: number;
+  /** How long a docker request waits for the job's VM. */
+  bootTimeoutSec: number;
+  /** Per repository: golden disk and image store, least recently used dropped at refresh. */
+  cacheLimitGiB: number;
+  /** Compressed bytes one pull may fetch. */
+  pullMaxGiB: number;
+  /** Compressed bytes all of one job's pulls may fetch. */
+  jobPullMaxGiB: number;
+  /** Free space on the data directory's volume under which boots and pulls are refused. */
+  minFreeGiB: number;
+}
+
+/** What resolveDockerVmConfig sizes its defaults from. */
+export interface DockerVmHost {
+  cores: number;
+  memoryBytes: number;
+}
+
+/** Each numeric key's range; a value outside it is clamped and logged. 0 for maxRunning means automatic. */
+const DOCKER_VM_RANGES: Record<Exclude<keyof DockerVmConfig, 'prewarm'>, [number, number]> = {
+  cpus: [1, 64],
+  memoryMiB: [1024, 65536],
+  maxRunning: [0, 64],
+  dataDiskGiB: [8, 4096],
+  bootTimeoutSec: [5, 600],
+  cacheLimitGiB: [1, 4096],
+  pullMaxGiB: [1, 1024],
+  jobPullMaxGiB: [1, 4096],
+  minFreeGiB: [1, 4096],
+};
+
+/**
+ * The `dockerVm` section as the running app reads it: resolved once, and
+ * again only when refresh() is called, at each worker spawn. The VM manager
+ * reads it at every state change and every 10 s while VMs run, and a read of
+ * config.yaml is synchronous file I/O on Electron main. Each warning is
+ * logged once for each distinct text, so a clamped value is reported once,
+ * not at every read.
+ */
+export class DockerVmConfigSource {
+  private cached: DockerVmConfig | undefined;
+  private readonly logged = new Set<string>();
+
+  constructor(
+    private readonly opts: {
+      read: () => AppConfig['dockerVm'] | undefined;
+      host: DockerVmHost;
+      log: (message: string) => void;
+    }
+  ) {}
+
+  current(): DockerVmConfig {
+    this.cached ??= this.resolve();
+    return this.cached;
+  }
+
+  refresh(): DockerVmConfig {
+    this.cached = this.resolve();
+    return this.cached;
+  }
+
+  private resolve(): DockerVmConfig {
+    return resolveDockerVmConfig(this.opts.read(), this.opts.host, (message) => {
+      if (this.logged.has(message)) return;
+      this.logged.add(message);
+      this.opts.log(message);
+    });
+  }
+}
+
+/**
+ * The `dockerVm` section of config.yaml as the VM backend uses it. Every key
+ * is optional. A value of the wrong type is taken as absent, and one out of
+ * range is clamped, each with a line through `log`; keys it does not know
+ * are ignored.
+ */
+export function resolveDockerVmConfig(
+  raw: AppConfig['dockerVm'] | undefined,
+  host: DockerVmHost,
+  log: (message: string) => void = () => {}
+): DockerVmConfig {
+  const GiB = 1024 ** 3;
+  const defaults: DockerVmConfig = {
+    prewarm: false,
+    cpus: Math.max(1, Math.min(4, host.cores)),
+    memoryMiB: 8192,
+    maxRunning: 0,
+    dataDiskGiB: 64,
+    bootTimeoutSec: 60,
+    cacheLimitGiB: 20,
+    pullMaxGiB: 10,
+    jobPullMaxGiB: 30,
+    minFreeGiB: 20,
+  };
+  const section: Record<string, unknown> = typeof raw === 'object' && raw !== null ? raw : {};
+  const resolved: DockerVmConfig = { ...defaults };
+
+  if (section.prewarm !== undefined) {
+    if (typeof section.prewarm === 'boolean') resolved.prewarm = section.prewarm;
+    else log(`dockerVm.prewarm must be true or false; using ${defaults.prewarm}`);
+  }
+  for (const key of Object.keys(DOCKER_VM_RANGES) as Array<keyof typeof DOCKER_VM_RANGES>) {
+    const value = section[key];
+    if (value === undefined) continue;
+    if (typeof value !== 'number' || !Number.isInteger(value)) {
+      log(`dockerVm.${key} must be a whole number; using ${defaults[key]}`);
+      continue;
+    }
+    const [min, max] = DOCKER_VM_RANGES[key];
+    const clamped = Math.min(max, Math.max(min, value));
+    if (clamped !== value) log(`dockerVm.${key} ${value} is outside ${min}-${max}; using ${clamped}`);
+    resolved[key] = clamped;
+  }
+  if (resolved.jobPullMaxGiB < resolved.pullMaxGiB) {
+    log(`dockerVm.jobPullMaxGiB ${resolved.jobPullMaxGiB} is less than pullMaxGiB; using ${resolved.pullMaxGiB}`);
+    resolved.jobPullMaxGiB = resolved.pullMaxGiB;
+  }
+  if (resolved.maxRunning === 0) {
+    resolved.maxRunning = Math.max(1, Math.floor(host.memoryBytes / GiB / 8));
+  }
+  return resolved;
 }
 
 /**
@@ -168,13 +329,17 @@ export const saveConfig = (config: AppConfig): void => {
     // Create a copy to avoid mutating the original config
     const configToSave: AppConfig = { ...config, configVersion: CONFIG_VERSION };
 
-    // Only persist refreshToken and user - access tokens are obtained fresh on startup
+    // Only persist refreshToken and user - access tokens are obtained fresh on
+    // startup - plus whether the session is known to be spent. Dropping that
+    // flag meant a restart forgot, presented the account as healthy, and went
+    // back to refreshing a token that can never work.
     if (configToSave.auth) {
-      const { refreshToken, user } = configToSave.auth;
+      const { refreshToken, user, expired } = configToSave.auth;
       if (refreshToken) {
         configToSave.auth = {
           refreshToken: encryptValue(refreshToken),
           user,
+          ...(expired ? { expired: true } : {}),
         };
       } else {
         // No refresh token means we can't persist auth

@@ -6,9 +6,12 @@
 import * as fs from 'fs';
 import * as path from 'path';
 import { shell } from 'electron';
+import { REMOVAL_PREFIX, moveAsideForRemoval, removeMovedAside } from '../shared/tree-removal';
+
+// Shared with the CLI, which removes a test workspace the same way.
+export { REMOVAL_PREFIX, moveAsideForRemoval, removeMovedAside };
 
 export type CleanupLogger = (message: string) => void;
-export type LeveledLogger = (level: 'info' | 'error', message: string) => void;
 
 /**
  * Validate that a child path stays within the expected base directory.
@@ -31,71 +34,9 @@ export function validateChildPath(base: string, childName: string): string | nul
 }
 
 /**
- * Kill orphaned runner processes found in sandbox directories.
- * Must be called BEFORE deleting sandbox directories since PID files are inside them.
- */
-export async function killOrphanedProcesses(
-  sandboxBase: string,
-  log: CleanupLogger
-): Promise<boolean> {
-  let killedAny = false;
-
-  try {
-    const entries = await fs.promises.readdir(sandboxBase, { withFileTypes: true });
-
-    for (const entry of entries) {
-      if (!entry.isDirectory() || entry.name.includes('.trash.')) continue;
-
-      const pidFile = path.join(sandboxBase, entry.name, 'runner.pid');
-      if (!fs.existsSync(pidFile)) continue;
-
-      try {
-        const pidStr = await fs.promises.readFile(pidFile, 'utf-8');
-        const pid = parseInt(pidStr.trim(), 10);
-        if (isNaN(pid)) continue;
-
-        // Check if process is running and kill it
-        try {
-          process.kill(pid, 0); // Check if alive
-          log(`Killing orphaned runner process group ${pid}`);
-          killedAny = true;
-          try {
-            process.kill(-pid, 'SIGTERM'); // Kill process group
-          } catch {
-            // Process group kill failed (not a group leader?) - fall back to single process
-            process.kill(pid, 'SIGTERM');
-          }
-          // Give it time to gracefully disconnect from GitHub
-          await new Promise(resolve => setTimeout(resolve, 2000));
-          // Force kill if still alive
-          try {
-            process.kill(pid, 0);
-            log(`Force killing orphaned process ${pid}`);
-            try {
-              process.kill(-pid, 'SIGKILL');
-            } catch {
-              // Process group kill failed - fall back to single process
-              process.kill(pid, 'SIGKILL');
-            }
-          } catch {
-            // Process exited after SIGTERM - this is the expected success case
-          }
-        } catch {
-          // Process not running (ESRCH) - already dead, nothing to do
-        }
-      } catch {
-        // Couldn't read PID file - corrupted or permissions issue, skip
-      }
-    }
-  } catch {
-    // Failed to scan sandbox directories - non-fatal, continue with cleanup
-  }
-
-  return killedAny;
-}
-
-/**
- * Clean up sandbox directories (both regular and trash directories).
+ * Clean up sandbox directories: each is moved out of its path and removed
+ * (see moveAsideForRemoval and removeMovedAside), and what an earlier run
+ * left part removed goes too.
  */
 export async function cleanupSandboxDirectories(
   sandboxBase: string,
@@ -113,13 +54,15 @@ export async function cleanupSandboxDirectories(
         continue;
       }
 
-      if (entry.name.includes('.trash.')) {
-        // Trash directories: try to remove (may have extended attributes blocking deletion)
+      // Already out of every job's reach: a removal an earlier run began, or
+      // trash an earlier version's sweep moved aside.
+      if (entry.name.startsWith(REMOVAL_PREFIX) || entry.name.includes('.trash.')) {
+        // Removed where they are (may have extended attributes blocking deletion)
         try {
-          await fs.promises.rm(dirPath, { recursive: true, force: true });
-          log(`Removed leftover trash: ${entry.name}`);
+          await removeMovedAside(dirPath);
+          log(`Removed leftover ${entry.name}`);
         } catch {
-          // fs.rm failed (likely due to macOS extended attributes on .app bundles)
+          // Removal failed (likely due to macOS extended attributes on .app bundles)
           // Fall back to moving to system Trash
           try {
             await shell.trashItem(dirPath);
@@ -129,27 +72,36 @@ export async function cleanupSandboxDirectories(
           }
         }
       } else {
-        // Regular sandbox directories: clean synchronously with timeout
+        // Regular sandbox directories: moved out of their path, never removed
+        // in it, then removed with a timeout
         log(`Removing sandbox: ${entry.name}`);
+        let aside: string | null;
         try {
-          const timeoutMs = 5000; // 5 seconds per directory
-          const rmPromise = fs.promises.rm(dirPath, { recursive: true, force: true });
-          const timeoutPromise = new Promise<never>((_, reject) =>
-            setTimeout(() => reject(new Error('timeout')), timeoutMs)
-          );
-          await Promise.race([rmPromise, timeoutPromise]);
+          aside = await moveAsideForRemoval(dirPath);
         } catch {
-          // Deletion failed or timed out - rename to trash for background cleanup
-          const trashDir = `${dirPath}.trash.${Date.now()}`;
-          try {
-            await fs.promises.rename(dirPath, trashDir);
-            log(`Moved ${entry.name} to trash for background cleanup`);
-            fs.promises.rm(trashDir, { recursive: true, force: true }).catch(() => {
-              // Background cleanup failure is non-fatal
-            });
-          } catch {
-            log(`Warning: Could not clean ${entry.name}, will retry when runner starts`);
-          }
+          log(`Warning: Could not move ${entry.name} aside to remove it; it stays until the next launch`);
+          continue;
+        }
+        if (!aside) continue;
+        const timeoutMs = 5000; // 5 seconds per directory
+        let timer: NodeJS.Timeout | undefined;
+        const rmPromise = removeMovedAside(aside);
+        try {
+          await Promise.race([
+            rmPromise,
+            new Promise<never>((_, reject) => {
+              timer = setTimeout(() => reject(new Error('timeout')), timeoutMs);
+            }),
+          ]);
+        } catch {
+          // Deletion failed or timed out: one still going finishes in the
+          // background, and what is left goes at the next startup
+          rmPromise.catch(() => {
+            // Background cleanup failure is non-fatal
+          });
+          log(`Could not finish removing ${entry.name} yet; the rest goes in the background or at the next startup`);
+        } finally {
+          clearTimeout(timer);
         }
       }
     }
@@ -232,24 +184,5 @@ export async function cleanupWorkDirectories(
     }
   } catch {
     // Failed to scan work directories - non-fatal
-  }
-}
-
-/**
- * Move a directory to trash for background cleanup.
- * Returns true if successful, false if rename failed.
- */
-export function moveToTrash(dirPath: string, log: CleanupLogger): boolean {
-  const trashDir = `${dirPath}.trash.${Date.now()}`;
-  try {
-    fs.renameSync(dirPath, trashDir);
-    log(`Moved to trash for background cleanup`);
-    // Delete in background (fire and forget)
-    fs.promises.rm(trashDir, { recursive: true, force: true }).catch(() => {
-      // Background cleanup - failures are non-fatal, will retry on next startup
-    });
-    return true;
-  } catch {
-    return false;
   }
 }

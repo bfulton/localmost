@@ -41,25 +41,25 @@ Features:
 - **Automatic fallback** — workflows detect when your Mac is available; fall back to hosted runners when it's not
 - **One-click setup** — no terminal commands, no manually generating registration tokens
 - **Lid-close protection** — close your laptop without killing in-progress jobs
-- **Multi-runner parallelism** — run 1-8 concurrent jobs
-- **Network isolation** — runner traffic is proxied through an allowlist (GitHub, npm, PyPI, etc.)
-- **Filesystem sandboxing** — runner processes can only write to their working directory
-- **Resource-aware scheduling** — automatically pause runners when on battery or during video calls
+- **A fresh macOS VM per job** — every job runs in a VM cloned from a golden image and thrown away afterwards, as a non-admin user with nothing of your Mac shared; two run at once
+- **Network isolation** — the VM has no network card: its only way out is a proxy that enforces the repository's allowlist (GitHub, npm, PyPI, etc.)
+- **Resource-aware scheduling** — automatically pause runners when on battery or during video calls; jobs already running finish (choose "Stop them" in the Power section of Settings to stop them instead), and resuming by hand overrides the pause until its condition clears
 
 ## What It Is
 
 localmost is a macOS app that manages GitHub's official [actions-runner](https://github.com/actions/runner) binary. It handles authentication, registration, runner process lifecycle, and automatic fallback — the tedious parts of self-hosted runners.
 
-**Security note:** Running CI jobs on your local machine has inherent risks—especially for public repos that accept external contributions. localmost sandboxes runner processes and restricts network access, but these are not VM-level isolation. See [SECURITY.md](SECURITY.md) for details on the threat model and recommendations.
+**Requirements:** a Mac with Apple silicon, running macOS 14 or later, with 6 GiB of memory to spare for each job VM. Intel Macs are not supported. The runner takes no jobs until its golden macOS image is built, from the macOS VM section of Settings.
+
+**Security note:** Running CI jobs on your local machine has inherent risks—especially for public repos that accept external contributions. Each job runs in a macOS VM of its own whose only way out is its proxy, so what remains is what the proxy allows and what the VM boundary itself holds. See [SECURITY.md](SECURITY.md) for details on the threat model and recommendations.
 
 ## Architecture
 
 <img src="docs/localmost-arch.png" alt="localmost architecture diagram" width="600" style="background-color: white; padding: 10px; border-radius: 8px;">
 
 - **Runner proxy** — maintains long-poll sessions with GitHub's broker to receive job assignments
-- **Runner pool** — 1-8 worker instances that execute jobs in sandboxed environments
-- **HTTP proxy** — allowlist-based network isolation for runner traffic (GitHub, npm, PyPI, etc.)
-- **Build cache** — persistent tool cache shared across job runs (Node.js, Python, etc.)
+- **Runner pool** — up to two workers, each running its job in a fresh macOS VM cloned from a golden image
+- **HTTP proxy** — allowlist-based network isolation for runner traffic (GitHub, npm, PyPI, etc.), the VM's only way out
 
 ## Workflow Integration
 
@@ -117,6 +117,21 @@ The check workflow uses a simple heartbeat mechanism:
 - On clean exit, localmost immediately marks the heartbeat stale so workflows fall back without waiting
 
 This fallback-to-cloud design is intentional: if your Mac is asleep, offline, or the heartbeat is stale for any reason, workflows continue running on GitHub-hosted runners rather than waiting or failing.
+
+## Docker in Jobs
+
+**Not available in this build.** Jobs run in a macOS VM, and the relay that carries the filtering Docker socket into it is the next piece of work: until it exists, a job whose approved policy grants Docker is refused, with a reason naming the missing relay. What follows is how container work behaves once it is back.
+
+A repository opts in to container work by declaring `pull`, `run` and `build` actions under `docker:` in its approved `.localmostrc`; anything unlisted is denied. Each job that does gets its own Linux VM, booted by localmost and discarded after the job, which sees none of your files but the job's work folder. Docker Desktop is not used. What that means for a policy:
+
+- **`routable` means through the job's proxy.** Containers on the default bridge, or on a network declared `internal: false`, reach only what the job's own network policy allows. Traffic that ignores the proxy settings is refused at once (a name lookup from an Alpine image takes its resolver's 5 s to fail).
+- **Proxy settings are injected.** localmost sets `HTTP_PROXY`, `HTTPS_PROXY`, `http_proxy`, `https_proxy` and `NO_PROXY` in routable containers and as build args, keeping any value the job sets itself.
+- **Base images must be pulled before a build.** The builder in the VM cannot reach a registry, so `docker pull` the `FROM` images first.
+- **Build tags are declared.** A `docker build -t` tag must match a `build.tags` glob. A tag with a registry host, or in a repository `run.images` names, is refused whatever `build.tags` says, so a build cannot stand in for an image the job runs, and a built image cannot be run by name. An untagged build needs no entry.
+- **`pull.registries` includes the registry's redirects.** Pulls run on the Mac, so registry credentials never enter the VM, and localmost follows a registry's redirects (to its CDN, usually) to any public https host, outside the job's `network.allow`. Only public https registries can be pulled from.
+- **Pulls are anonymous until a registry asks for credentials.** Public images never run a credential helper. When a registry does ask, the helper `~/.docker/config.json` names (`credsStore` or `credHelpers`) must answer, or the pull fails naming the key: with `credsStore: desktop`, Docker Desktop's helper answers only while Docker Desktop is running. Start it, or change the key.
+
+The policy grammar is in [docs/roadmap/localmostrc.md](docs/roadmap/localmostrc.md#docker-access), and what the VM does and does not contain is under Docker Access in [SECURITY.md](SECURITY.md).
 
 ## GitHub App Permissions
 
@@ -189,10 +204,10 @@ localmost stop
 # Check runner status
 localmost status
 
-# Pause the runner (stops accepting new jobs)
+# Pause the runner (takes no new jobs; a running job finishes)
 localmost pause
 
-# Resume the runner
+# Resume the runner (overrides a battery or video call pause until it clears)
 localmost resume
 
 # View recent job history
@@ -205,6 +220,12 @@ localmost targets add my-org --org           # Register runners for an org
 localmost targets disable bfulton/supdb      # Stop accepting its jobs
 localmost targets remove bfulton/supdb       # Unregister its runners
 localmost targets list --json                # Machine-readable output
+
+# Build and watch the golden macOS VM image (headless, no Settings GUI needed)
+localmost image status                       # State, progress and disk
+localmost image build                        # Build it (or follow a running build)
+localmost image build --rebuild              # Build a new one even if one is ready
+localmost image cancel                       # Cancel a running build
 ```
 
 Adding a target registers one runner per concurrent job slot with GitHub, and the
@@ -212,11 +233,39 @@ running app picks up the new target without a restart. Removing one unregisters
 those runners; `remove` asks for confirmation unless you pass `--yes`, and refuses
 to run unconfirmed outside a terminal. Every subcommand accepts `--json`.
 
+`localmost image` builds the golden macOS VM image the runner needs, for a headless
+CI Mac with no Settings GUI. `image build` starts the build (or follows one already
+running) and streams its progress until the image is ready, exiting 0 on success and
+non-zero on error; it fails fast with the reason when this Mac cannot build (an
+unsupported host, a missing helper, or too little free disk). The build runs in the
+app, not the command: pressing Ctrl-C detaches and leaves the build running, so it
+survives the terminal closing - check it again with `image status`, stop it with
+`image cancel`. If an image is already ready, `image build` says so and does nothing
+unless you pass `--rebuild`.
+
+### Testing workflows locally
+
+```bash
+localmost test                    # Run the default workflow
+localmost test ci.yml --job build # One job of one workflow
+localmost test --updaterc         # Record the hosts it reaches into .localmostrc
+```
+
+`localmost test` runs a workflow's steps in a fresh macOS VM from the same golden
+image, slots and helper as runner jobs, so the app must be running with the image
+built (Settings > macOS VM). It copies the checkout (or `--staged` changes) in as
+the workspace, runs each step there as the guest's non-admin user, and streams the
+output back with secrets masked. The VM's only way out is the run's proxy, which
+holds steps to the checkout's `.localmostrc` network policy - after you confirm any
+host it allows - or, under `--updaterc`, lets every host through and records it.
+Filesystem access is not recorded yet, and filesystem grants and `docker:` are not
+given in the VM yet; the run says which it goes without.
+
 ### Installing the CLI
 
 From the app menu: **localmost → Install Command Line Tool...**
 
-This creates a symlink in `/usr/local/bin` so you can use `localmost` from any terminal. You'll be prompted for your administrator password.
+This creates a symlink in `/usr/local/bin` so you can use `localmost` from any terminal. You'll be prompted for your administrator password. The command runs with the `node` first on your `PATH`, so it needs Node.js installed.
 
 For development builds, use `npm link` instead.
 
@@ -238,36 +287,45 @@ npm start
 # Run tests
 npm test
 
-# Build for macOS (creates .dmg)
+# Build for Apple silicon (creates .dmg)
 npm run make
 ```
+
+Packaging the app (`npm run make`, and `npm run test:e2e`, which packages it
+first) runs `npm run build:native` to build the macOS VM's helper and guest
+agent and the Docker VM's helper and guest, and fetch the docker CLI. That
+needs Xcode's Swift and Go, and the guest build boots a VM, so run it on the
+Mac itself, not inside a localmost job. `npm test` needs none of this. Its
+sandbox tests - of the profiles localmost's own VM helpers run under - construct
+seatbelt profiles, which works on the Mac and in a macOS VM job alike. The
+guest agent's unit tests run with `swift test` in `native/localmost-macvm`.
 
 ## Roadmap
 
 Current release: **0.3.0 — Test Locally, Secure by Default**
-- Run workflows locally before pushing with `localmost test`
+- Run workflows locally before pushing with `localmost test`, in the same macOS VM as runner jobs
 - Declarative sandbox policies with `.localmostrc`
 - Sandbox policy levels (strict / moderate / permissive) declared per repository and enforced by the local proxy
 - Contributor-based job filtering for public repos
-- Repository policies require approval before the runner applies them
+- Repository policies require approval before the runner applies them, in the app or the CLI, bound to the exact policy shown and recorded in an audit log
 - Opt-in [container work through a filtering Docker socket](docs/superpowers/specs/2026-09-05-docker-isolation-design.md) declared per repo as `pull`, `run` and `build` actions; anything unlisted is denied, and registry credentials never enter the sandbox
+- [macOS VM jobs](docs/roadmap/macos-vm-jobs.md): every job runs in a fresh macOS VM cloned from a golden image, as a non-admin guest user with no network card and nothing of the host shared
 - Environment comparison with GitHub runners
 
 Future feature ideas:
 
 - **Fail a blocked job visibly** - a job refused by the filter is cancelled through the GitHub API before any worker starts, so it appears as cancelled rather than failing with a message explaining why.
-- **Roll discovery output up further** - `--updaterc` now drops paths already covered by a listed ancestor, which removes the bulk of the redundancy. It still records content-addressed cache paths (npm's `_cacache/content-v2/sha512/...`) verbatim, which differ per machine and per dependency change; those want rolling up to their cache directory.
-- **Approve policies in the app** - approval is CLI-only today (`localmost policy diff`, `localmost policy approve`). The app refuses the job and logs the diff, but there is no UI to review and accept it, and no audit log of approvals.
-- **Show a diff when `--updaterc` rewrites a policy** - it writes directly, with no diff and no confirmation, so a discovery run can widen a checked-in policy without the change being obvious.
+- **Show a full diff when `--updaterc` rewrites a policy** - it names the file and lists every grant it adds before asking, but it rewrites the whole file from the parsed policy, so the comments and formatting it drops are not shown.
 - **Homebrew formula** - `npx localmost` works; `brew install localmost` does not exist.
 - **Quick actions** - Re-run failed job, cancel all jobs.
 - **Spotlight integration** - Check status or pause builds from Spotlight.
 - **Artifact inspector** - Browse uploaded artifacts without leaving the app.
-- **Disk space monitoring** - Warn or pause when disk is low, auto-clean old work dirs.
+- **Disk space monitoring** - Warn or pause when disk is low, auto-clean trash directories and caches.
 - **Linux and Windows host support** - Run self-hosted runners on non-Mac machines for projects that need them.
-- **Higher parallelism cap** - Parallelize proxy registration to support 16+ concurrent runners (currently capped at 8 due to serial registration time).
-- **Managed Docker VM** - Run the daemon behind the filtering socket in a VM whose only mount is the workspace, so a filter defect is contained, container egress is policed, and `privileged` becomes grantable.
-- **Ephemeral VM isolation** - Run each job in a fresh lightweight VM for stronger isolation between jobs.
+- **Docker in macOS VM jobs** - A vsock relay from the guest to the worker's filtering Docker socket, and a workspace shared with the job's Docker VM, so a policy's `docker:` works again.
+- **Filesystem grants as VM shares** - Give a macOS VM job the paths its policy grants, as read-only shares or per-job clones ([design](docs/roadmap/macos-vm-jobs.md#not-built-yet)).
+- **Filesystem discovery in the VM** - Record the paths a `localmost test --updaterc` run's steps miss in the guest, so discovery suggests filesystem grants again.
+- **Filtering VM network stack** - A userspace network stack for the Docker VM that enforces the job's hostname policy on traffic that ignores proxy settings ([design](docs/roadmap/vm-network-stack.md)).
 
 Bugs and quick improvements:
 

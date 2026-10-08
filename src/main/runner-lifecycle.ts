@@ -14,6 +14,7 @@ import {
 } from './app-state';
 import { AppConfig } from './config';
 import { DEFAULT_RUNNER_COUNT } from '../shared/constants';
+import { parseSavedGitHubRepoUrl } from '../shared/github-names';
 /** Delay before retry in milliseconds. */
 const RETRY_DELAY_MS = 2000;
 
@@ -76,20 +77,25 @@ const getRegistrationTargets = (config: AppConfig): RegistrationTarget[] => {
   }
 
   // Repo-level runner (check repoUrl regardless of level setting for robustness)
-  if (runnerConfig.repoUrl) {
-    const match = runnerConfig.repoUrl.match(/github\.com[\/:]([^\/]+)\/([^\/\.]+)/);
-    if (match) {
-      const [, owner, repo] = match;
-      return [{
-        type: 'repo',
-        owner,
-        repo,
-        displayName: `${owner}/${repo}`,
-      }];
-    }
-  }
+  const repoTarget = repoTargetFromUrl(runnerConfig.repoUrl);
+  return repoTarget ? [repoTarget] : [];
+};
 
-  return [];
+/**
+ * The repository a config from before targets names by its URL: GitHub's
+ * html_url for it, as the setup wizard saved it. A repo name keeps its dots,
+ * an owner may be an older login new accounts cannot take, and a URL that is
+ * not a repository on github.com names none.
+ */
+const repoTargetFromUrl = (repoUrl: string | undefined): RegistrationTarget | undefined => {
+  const parsed = repoUrl ? parseSavedGitHubRepoUrl(repoUrl) : null;
+  if (!parsed) return undefined;
+  return {
+    type: 'repo',
+    owner: parsed.owner,
+    repo: parsed.repo,
+    displayName: `${parsed.owner}/${parsed.repo}`,
+  };
 };
 
 /**
@@ -153,6 +159,12 @@ export const clearStaleRunnerRegistrations = async (): Promise<void> => {
   }
 
   const config = loadConfig();
+
+  // Every start comes through here before the broker loads the targets'
+  // credentials, so a registration key earlier versions let jobs read is
+  // replaced before anything opens a session with it.
+  await replaceExposedProxyKeys(config);
+
   const runnerConfig = config.runnerConfig;
   if (!runnerConfig?.runnerName) {
     return; // No runner name configured
@@ -266,6 +278,19 @@ export const clearStaleRunnerRegistrations = async (): Promise<void> => {
 };
 
 /**
+ * Give a new key to each proxy registration whose key earlier versions copied
+ * into jobs' sandboxes. Disabled targets too: a taken key works whether or not
+ * this app is polling for it.
+ */
+const replaceExposedProxyKeys = async (config: AppConfig): Promise<void> => {
+  const { getRunnerProxyManager } = await import('./runner-proxy-manager');
+  const proxyManager = getRunnerProxyManager();
+  for (const target of config.targets || []) {
+    await proxyManager.replaceExposedKeys(target);
+  }
+};
+
+/**
  * Ensure all targets have valid proxy registrations on GitHub.
  * Re-registers proxies that are missing or were deleted.
  */
@@ -318,7 +343,7 @@ const ensureProxyRegistrations = async (
 
 /**
  * Re-register a single runner instance after detecting session conflict or registration deletion.
- * This stops the instance, deletes the GitHub registration, clears config, re-registers, and restarts.
+ * This stops the instance, deletes the GitHub registration, clears config and re-registers.
  */
 export const reRegisterSingleInstance = async (
   instanceNum: number,
@@ -445,10 +470,10 @@ const doReRegisterInstance = async (
     },
   });
 
-  logger?.info(`Re-registration of instance ${instanceNum} complete, restarting...`);
-
-  // Restart the instance
-  await runnerManager.startInstance(instanceNum);
+  // Not restarted here. Only the worker spawned for a job may take it, so one
+  // started now would have no job and never get one; the slot is started
+  // again by the next job spawned into it.
+  logger?.info(`Re-registration of instance ${instanceNum} complete; the next job for it starts its worker`);
 };
 
 /**
@@ -495,17 +520,8 @@ export const reRegisterRunner1 = async (
         owner: runnerConfig.orgName,
         displayName: runnerConfig.orgName,
       };
-    } else if (runnerConfig.repoUrl) {
-      const match = runnerConfig.repoUrl.match(/github\.com[\/:]([^\/]+)\/([^\/\.]+)/);
-      if (match) {
-        const [, owner, repo] = match;
-        registrationTarget = {
-          type: 'repo',
-          owner,
-          repo,
-          displayName: `${owner}/${repo}`,
-        };
-      }
+    } else {
+      registrationTarget = repoTargetFromUrl(runnerConfig.repoUrl);
     }
   }
 

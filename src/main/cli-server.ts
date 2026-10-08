@@ -2,18 +2,24 @@
  * CLI Server - Unix domain socket server for CLI communication.
  *
  * Enables the CLI to communicate with the running Electron app.
- * Supports commands: status, pause, resume, jobs, quit
+ * Supports commands: status, pause, resume, jobs, quit, the targets
+ * commands, and test-vm, which lends `localmost test` a macOS VM for as long
+ * as its connection stays open.
  */
 
+import * as crypto from 'crypto';
 import * as net from 'net';
 import * as fs from 'fs';
 import { app } from 'electron';
 import { getCliSocketPath } from './paths';
-import { getRunnerManager, getHeartbeatManager, getAuthState } from './app-state';
-import { getSnapshot, selectRunnerStatus, selectEffectivePauseState } from './runner-state-service';
+import { getRunnerManager, getHeartbeatManager, getAuthState, getRunnerState, getResourceMonitor } from './app-state';
+import { pauseRunner, resumeRunner } from './runner-pause';
+import { getSnapshot, isRunning as isRunnerStarted, isStarting as isRunnerStarting, selectEffectivePauseState } from './runner-state-service';
+import { resourcePauseOverriddenText } from '../shared/resource-pause-text';
 import { getTargetManager } from './target-manager';
 import { getRunnerProxyManager } from './runner-proxy-manager';
 import type { Target } from '../shared/types';
+import { isGitHubOwnerName, isGitHubRepoName } from '../shared/github-names';
 import type {
   CliRequest,
   CliResponse,
@@ -22,9 +28,13 @@ import type {
   ActionResponse,
   TargetsListResponse,
   TargetMutationResponse,
+  ImageStatusResponse,
+  ImageBuildResponse,
   ErrorResponse,
   TargetSummary,
 } from '../shared/cli-protocol';
+import type { MacVmSetupStatus } from '../shared/macos-vm-setup';
+import type { IsolationAvailability, VmLease } from './isolation/macos-vm';
 
 // Re-exported so importers of ./cli-server keep working.
 export type {
@@ -35,6 +45,8 @@ export type {
   ActionResponse,
   TargetsListResponse,
   TargetMutationResponse,
+  ImageStatusResponse,
+  ImageBuildResponse,
   ErrorResponse,
   TargetSummary,
 };
@@ -46,6 +58,51 @@ export type {
  */
 const asName = (value: unknown): string | null =>
   typeof value === 'string' && value.trim() ? value.trim() : null;
+
+/** Longer than any request the CLI sends, by orders of magnitude. */
+const MAX_REQUEST_LINE_CHARS = 64 * 1024;
+
+/**
+ * Requests one connection may have waiting before the server stops reading
+ * it. The CLI sends one at a time; this is room for a script that pipelines.
+ */
+const MAX_QUEUED_REQUESTS = 32;
+
+/** The macOS VMs a `localmost test` run can borrow: the job backend's. */
+export interface TestVmProvider {
+  available(): IsolationAvailability;
+  /** Boots a VM for the lease and resolves with its agent socket. */
+  prepareTestRun(lease: VmLease, signal?: AbortSignal): Promise<string>;
+  release(lease: VmLease): Promise<void>;
+}
+
+/**
+ * The golden-image manager the CLI's `image` commands reach: the same
+ * MacVmImageManager the Settings GUI drives, so a headless CI Mac can build
+ * and watch the image without the window. Unlike a test VM's lease, nothing
+ * here is tied to the connection: build() runs on, and the image stays, when
+ * the CLI disconnects.
+ */
+export interface ImageControl {
+  status(): MacVmSetupStatus;
+  ready(): unknown | null;
+  build(): void;
+  cancel(): void;
+  on(event: 'status', listener: (status: MacVmSetupStatus) => void): unknown;
+  off(event: 'status', listener: (status: MacVmSetupStatus) => void): unknown;
+}
+
+/** A build is settled once its status reaches one of these: nothing more streams. */
+const isSettledImageState = (status: MacVmSetupStatus): boolean =>
+  status.state === 'ready' || status.state === 'failed' || status.state === 'unsupported' || status.state === 'not-built';
+
+/** A build (or a wait for the guided setup) is in flight. */
+const isBuildingImageState = (status: MacVmSetupStatus): boolean =>
+  status.state === 'building' || status.state === 'needs-guided-setup';
+
+const formatGiB = (bytes: number): string => `${(bytes / 2 ** 30).toFixed(bytes < 10 * 2 ** 30 ? 1 : 0)} GB`;
+
+const isPort = (value: unknown): value is number => Number.isInteger(value) && (value as number) >= 1 && (value as number) <= 65535;
 
 /**
  * Describe a target for the CLI, including how many runner proxies are
@@ -69,12 +126,25 @@ export class CliServer {
   private server: net.Server | null = null;
   private socketPath: string;
   private onLog: (level: 'info' | 'warn' | 'error', message: string) => void;
+  private testVms: TestVmProvider | undefined;
+  private images: ImageControl | undefined;
+  /** Open connections, so stop() can end them rather than wait on them. */
+  private sockets = new Set<net.Socket>();
+  /**
+   * Connections holding (or booting) a test VM, one lease each, and how to
+   * release it: once, resolving when the VM is gone.
+   */
+  private leasing = new Map<net.Socket, () => Promise<void>>();
 
   constructor(options: {
     onLog: (level: 'info' | 'warn' | 'error', message: string) => void;
+    testVms?: TestVmProvider;
+    images?: ImageControl;
   }) {
     this.socketPath = getCliSocketPath();
     this.onLog = options.onLog;
+    this.testVms = options.testVms;
+    this.images = options.images;
   }
 
   /**
@@ -120,7 +190,10 @@ export class CliServer {
   }
 
   /**
-   * Stop the CLI server.
+   * Stop the CLI server. Open connections are destroyed rather than waited
+   * for: a `localmost test` run holds its connection for the whole run, and
+   * close() alone would hold up the app's quit until it finished. Destroying
+   * a connection releases the VM it borrowed.
    */
   async stop(): Promise<void> {
     return new Promise((resolve) => {
@@ -137,6 +210,7 @@ export class CliServer {
           this.server = null;
           resolve();
         });
+        for (const socket of this.sockets) socket.destroy();
       } else {
         resolve();
       }
@@ -147,35 +221,261 @@ export class CliServer {
    * Handle an incoming connection.
    */
   private handleConnection(socket: net.Socket): void {
+    this.sockets.add(socket);
+    socket.once('close', () => {
+      this.sockets.delete(socket);
+      this.leasing.delete(socket);
+    });
     let buffer = '';
+    // Requests on one connection run one at a time, in the order sent. Each
+    // data event used to start its own, so a pause still stopping the runner
+    // could be overtaken by the resume sent after it. While the queue is full
+    // the socket is not read, so a client sending faster than it is answered
+    // waits in its own buffers rather than growing ours.
+    const queue: string[] = [];
+    let draining = false;
+    let paused = false;
+    let refused = false;
+    // Decoded as one stream, so a character split across two reads survives.
+    socket.setEncoding('utf8');
 
-    socket.on('data', async (data) => {
-      buffer += data.toString();
+    const answer = async (line: string): Promise<void> => {
+      try {
+        const request = JSON.parse(line) as CliRequest;
+        // image-build streams many lines on this connection and writes them
+        // itself, so it is not one response for answer() to write.
+        if (request?.command === 'image-build') {
+          this.streamImageBuild(socket, request.args);
+          return;
+        }
+        const response = request?.command === 'test-vm'
+          ? await this.lendTestVm(socket, request.args)
+          : request?.command === 'test-vm-release'
+            ? await this.releaseTestVm(socket)
+            : await this.handleCommand(request);
+        socket.write(JSON.stringify(response) + '\n');
+      } catch (parseError) {
+        const errorResponse: ErrorResponse = {
+          success: false,
+          error: `Invalid request: ${(parseError as Error).message}`,
+        };
+        socket.write(JSON.stringify(errorResponse) + '\n');
+      }
+    };
+
+    const drain = async (): Promise<void> => {
+      if (draining) return;
+      draining = true;
+      while (queue.length > 0 && !socket.destroyed) {
+        await answer(queue.shift()!);
+        if (paused && queue.length < MAX_QUEUED_REQUESTS) {
+          paused = false;
+          socket.resume();
+        }
+      }
+      queue.length = 0;
+      draining = false;
+    };
+
+    socket.on('data', (data: string) => {
+      if (refused) return;
+      buffer += data;
 
       // Try to parse complete JSON messages
       const lines = buffer.split('\n');
       buffer = lines.pop() || ''; // Keep incomplete line in buffer
 
-      for (const line of lines) {
-        if (!line.trim()) continue;
-
-        try {
-          const request = JSON.parse(line) as CliRequest;
-          const response = await this.handleCommand(request);
-          socket.write(JSON.stringify(response) + '\n');
-        } catch (parseError) {
-          const errorResponse: ErrorResponse = {
-            success: false,
-            error: `Invalid request: ${(parseError as Error).message}`,
-          };
-          socket.write(JSON.stringify(errorResponse) + '\n');
-        }
+      // A request is a line of JSON a few hundred bytes long. Buffering an
+      // unterminated one without limit let any client grow the app's memory
+      // until it was killed.
+      if (buffer.length > MAX_REQUEST_LINE_CHARS) {
+        refused = true;
+        buffer = '';
+        const errorResponse: ErrorResponse = { success: false, error: 'Invalid request: too large' };
+        // The rest of the upload is read and dropped rather than left unread,
+        // which would reset the connection before the client saw the answer;
+        // a client that keeps sending is cut off shortly after.
+        socket.end(JSON.stringify(errorResponse) + '\n');
+        setTimeout(() => socket.destroy(), 1000).unref();
+        return;
       }
+
+      for (const line of lines) {
+        if (line.trim()) queue.push(line);
+      }
+      if (queue.length >= MAX_QUEUED_REQUESTS && !paused) {
+        paused = true;
+        socket.pause();
+      }
+      void drain();
     });
 
     socket.on('error', (err) => {
       this.onLog('warn', `CLI client error: ${err.message}`);
     });
+  }
+
+  /**
+   * Boot a macOS VM for a `localmost test` run and answer with its agent
+   * socket. The VM is the connection's: it is released when the connection
+   * closes, and a connection that closes while the VM boots cancels it.
+   */
+  private async lendTestVm(socket: net.Socket, args: CliRequest['args']): Promise<CliResponse> {
+    this.onLog('info', 'CLI request: test-vm');
+    const vms = this.testVms;
+    if (!vms) return { success: false, error: 'This app has no macOS VMs to run a workflow in' };
+    const proxyPort = args?.proxyPort;
+    const brokerPort = args?.brokerPort;
+    if (!isPort(proxyPort) || !isPort(brokerPort) || proxyPort === brokerPort) {
+      return { success: false, error: 'Missing or invalid ports for the test run' };
+    }
+    // A run needs one VM. Leasing more on the same connection would let one
+    // client hold every slot the runner has.
+    if (this.leasing.has(socket)) {
+      return { success: false, error: 'This connection already has a macOS VM' };
+    }
+    const availability = vms.available();
+    if (!availability.ok) {
+      return { success: false, error: `No macOS VM can run the workflow: ${availability.reason}` };
+    }
+    const lease: VmLease = { key: `test-${crypto.randomBytes(6).toString('hex')}`, proxyPort, brokerPort };
+    const abort = new AbortController();
+    let released: Promise<void> | null = null;
+    const release = (): Promise<void> => {
+      released ??= (() => {
+        abort.abort();
+        return vms.release(lease).catch((err: Error) => this.onLog('warn', `Releasing the macOS VM of ${lease.key} failed: ${err.message}`));
+      })();
+      return released;
+    };
+    this.leasing.set(socket, release);
+    socket.once('close', () => void release());
+    try {
+      const agentSocket = await vms.prepareTestRun(lease, abort.signal);
+      if (socket.destroyed) {
+        void release();
+        this.leasing.delete(socket);
+        return { success: false, error: 'The test run went away while its macOS VM started' };
+      }
+      this.onLog('info', `Lent a macOS VM to localmost test (${lease.key})`);
+      return { success: true, command: 'test-vm', data: { agentSocket } };
+    } catch (err) {
+      void release();
+      this.leasing.delete(socket);
+      return { success: false, error: `Could not lend the test run a macOS VM: ${(err as Error).message}` };
+    }
+  }
+
+  /**
+   * Release the test VM this connection holds, and answer once it is gone:
+   * the run keeps its proxy and broker ports until then, so no other
+   * process can take a port the VM's relays still lead to.
+   */
+  private async releaseTestVm(socket: net.Socket): Promise<CliResponse> {
+    const release = this.leasing.get(socket);
+    if (!release) return { success: false, error: 'This connection has no macOS VM' };
+    await release();
+    return { success: true, command: 'test-vm-release' };
+  }
+
+  /**
+   * Build the golden image (or follow a build already running) and stream its
+   * progress on this connection: a line each time the status changes, then a
+   * last line with `done: true` once it settles.
+   *
+   * The build belongs to the app, not this connection. Closing the connection
+   * only detaches from the stream - the status listener is removed and nothing
+   * is cancelled - so a build survives the CLI disconnecting, which is the
+   * whole point on a headless CI Mac. Cancelling is its own command.
+   */
+  private streamImageBuild(socket: net.Socket, args: CliRequest['args']): void {
+    const images = this.images;
+    if (!images) {
+      socket.write(JSON.stringify({ success: false, error: 'This app has no macOS VM image to build' } as ErrorResponse) + '\n');
+      return;
+    }
+    const status = images.status();
+
+    // A build is already running: do not start a second one; follow this one.
+    if (isBuildingImageState(status)) {
+      this.onLog('info', 'CLI request: image-build (a build is already running; streaming it)');
+      this.streamStatusUntilSettled(socket, images, 'already-running');
+      return;
+    }
+
+    // An image is already ready: say so and finish, unless a rebuild is asked.
+    if (images.ready() && args?.rebuild !== true) {
+      this.onLog('info', 'CLI request: image-build (an image is already ready)');
+      socket.write(JSON.stringify({ success: true, command: 'image-build', data: { status, done: true, note: 'already-ready' } } as ImageBuildResponse) + '\n');
+      return;
+    }
+
+    // Fail fast with the specific reason the status gives when this Mac cannot
+    // build, rather than letting build() throw a bare message or stall.
+    const refusal = this.buildRefusal(status);
+    if (refusal) {
+      this.onLog('info', `CLI request: image-build refused: ${refusal}`);
+      socket.write(JSON.stringify({ success: false, error: refusal } as ErrorResponse) + '\n');
+      return;
+    }
+
+    try {
+      images.build();
+    } catch (err) {
+      // build()'s own guards (e.g. the runner is not downloaded) surface here.
+      socket.write(JSON.stringify({ success: false, error: (err as Error).message } as ErrorResponse) + '\n');
+      return;
+    }
+    this.onLog('info', 'CLI request: image-build (started)');
+    this.streamStatusUntilSettled(socket, images);
+  }
+
+  /** The reason this Mac cannot build the image now, or null when it can. */
+  private buildRefusal(status: MacVmSetupStatus): string | null {
+    if (status.state === 'unsupported') {
+      return status.reason ?? 'this Mac cannot build a macOS VM image';
+    }
+    const { freeBytes, neededBytes } = status.disk;
+    if (neededBytes > 0 && freeBytes < neededBytes) {
+      return `not enough free disk to build the golden image: ${formatGiB(freeBytes)} free, about ${formatGiB(neededBytes)} needed`;
+    }
+    return null;
+  }
+
+  /**
+   * Write the current status at once, then one line per status change, until
+   * the build settles; `note` rides the first line. Removes its listener when
+   * the build ends or the connection closes - and closing, nothing else.
+   */
+  private streamStatusUntilSettled(socket: net.Socket, images: ImageControl, note?: 'already-running'): void {
+    let finished = false;
+    const write = (status: MacVmSetupStatus, done: boolean, withNote?: ImageBuildResponse['data']['note']): void => {
+      const data: ImageBuildResponse['data'] = { status, done, ...(withNote ? { note: withNote } : {}) };
+      socket.write(JSON.stringify({ success: true, command: 'image-build', data } as ImageBuildResponse) + '\n');
+    };
+    const finish = (status: MacVmSetupStatus): void => {
+      if (finished) return;
+      finished = true;
+      images.off('status', listener);
+      write(status, true);
+    };
+    const listener = (status: MacVmSetupStatus): void => {
+      if (finished || socket.destroyed) return;
+      if (isSettledImageState(status)) finish(status);
+      else write(status, false);
+    };
+    images.on('status', listener);
+    socket.once('close', () => {
+      // Detaching from the stream must not cancel the build.
+      if (!finished) {
+        finished = true;
+        images.off('status', listener);
+      }
+    });
+    // The status right now: either already settled, or the first progress line.
+    const now = images.status();
+    if (isSettledImageState(now)) finish(now);
+    else write(now, false, note);
   }
 
   /**
@@ -190,11 +490,12 @@ export class CliServer {
 
     switch (request.command) {
       case 'status': {
-        // Use state machine for consistent status with UI
+        // Status from the runner; the machine is never told about jobs.
         const snapshot = getSnapshot();
-        const runnerState = snapshot ? selectRunnerStatus(snapshot) : { status: 'offline' as const };
+        const runnerState = getRunnerState();
         const pauseState = snapshot ? selectEffectivePauseState(snapshot) : { isPaused: false, reason: null };
         const runnerName = runnerManager?.getStatusDisplayName() || 'unknown';
+        const overridden = getResourceMonitor()?.getPauseState().overridden ?? null;
 
         return {
           success: true,
@@ -205,12 +506,21 @@ export class CliServer {
             heartbeat: {
               isRunning: heartbeatManager?.isRunning() || false,
             },
-            authenticated: !!authState,
+            // Authenticated means the app can act as this user. A session
+            // whose refresh token is spent cannot, so it is reported apart
+            // from "not connected at all" - the login is still known, and
+            // reconnecting is a different action from signing in fresh.
+            authenticated: !!authState && !authState.expired,
+            authExpired: !!authState?.expired,
             userName: authState?.user?.login,
+            // A pause is recorded whatever state the runner is in; the CLI
+            // shows it in place of the status only for the runner it holds.
+            runnerStarted: isRunnerStarted() || isRunnerStarting(),
             resourcePause: {
               isPaused: pauseState.isPaused,
               reason: pauseState.reason,
               conditions: [],
+              overridden,
             },
           },
         };
@@ -230,21 +540,20 @@ export class CliServer {
           return { success: false, error: 'Runner manager not initialized' };
         }
 
-        if (!runnerManager.isRunning()) {
-          return {
-            success: true,
-            command: 'pause',
-            message: 'Runner is already paused',
-          };
-        }
-
+        // The pause the tray sets. Whether the runner is paused is that flag,
+        // not whether it has workers: they are spawned per job, so an idle
+        // runner has none and this used to call it paused while it took jobs.
         try {
-          await runnerManager.stop();
-          heartbeatManager?.stop();
+          const outcome = await pauseRunner();
+          if (outcome === 'not-started') {
+            return { success: false, error: 'Runner is not started, so there is nothing to pause' };
+          }
           return {
             success: true,
             command: 'pause',
-            message: 'Runner paused successfully',
+            message: outcome === 'already-paused'
+              ? 'Runner is already paused'
+              : 'Runner paused: it takes no new jobs, and a job already running finishes',
           };
         } catch (err) {
           return { success: false, error: `Failed to pause: ${(err as Error).message}` };
@@ -256,27 +565,26 @@ export class CliServer {
           return { success: false, error: 'Runner manager not initialized' };
         }
 
-        if (runnerManager.isRunning()) {
-          return {
-            success: true,
-            command: 'resume',
-            message: 'Runner is already running',
-          };
-        }
-
         if (!runnerManager.isConfigured()) {
           return { success: false, error: 'Runner is not configured. Please complete setup in the app.' };
         }
 
         try {
-          await runnerManager.start();
-          // Note: heartbeat resume would require more setup (auth tokens, etc.)
-          // For now, CLI resume just starts the runner
-          return {
-            success: true,
-            command: 'resume',
-            message: 'Runner resumed successfully',
-          };
+          const outcome = await resumeRunner();
+          if (outcome === 'not-started') {
+            return { success: false, error: 'Runner is not started. Start it from the app.' };
+          }
+          // A resume overrides the resource conditions holding, until each
+          // clears; say which, since one recurring then pauses it again.
+          const overridden = getResourceMonitor()?.getPauseState().overridden;
+          const message = outcome === 'already-running'
+            ? 'Runner is already running'
+            : outcome === 'starting'
+              ? 'Runner is still starting, and is not paused'
+              : overridden
+                ? resourcePauseOverriddenText(overridden)
+                : 'Runner resumed';
+          return { success: true, command: 'resume', message };
         } catch (err) {
           return { success: false, error: `Failed to resume: ${(err as Error).message}` };
         }
@@ -302,10 +610,18 @@ export class CliServer {
         if (!ownerName) {
           return { success: false, error: 'Missing or invalid target owner' };
         }
+        // The names become GitHub API paths requested with the user's token;
+        // anything GitHub would not accept as a name is refused here.
+        if (!isGitHubOwnerName(ownerName)) {
+          return { success: false, error: `"${ownerName}" is not a valid GitHub user or organization name` };
+        }
 
         const repoName = asName(repo);
         if (type === 'repo' && !repoName) {
           return { success: false, error: 'Missing or invalid repo name for a repo target' };
+        }
+        if (type === 'repo' && !isGitHubRepoName(repoName)) {
+          return { success: false, error: `"${repoName}" is not a valid GitHub repository name` };
         }
 
         const result = await getTargetManager().addTargetAndAttach(
@@ -381,6 +697,24 @@ export class CliServer {
           command: 'targets-update',
           data: { target: toTargetSummary(result.data) },
         };
+      }
+
+      case 'image-status': {
+        if (!this.images) {
+          return { success: false, error: 'This app has no macOS VM image' };
+        }
+        return { success: true, command: 'image-status', data: { status: this.images.status() } };
+      }
+
+      case 'image-cancel': {
+        if (!this.images) {
+          return { success: false, error: 'This app has no macOS VM image' };
+        }
+        if (!isBuildingImageState(this.images.status())) {
+          return { success: true, command: 'image-cancel', message: 'No golden image build is running.' };
+        }
+        this.images.cancel();
+        return { success: true, command: 'image-cancel', message: 'Cancelling the golden image build.' };
       }
 
       case 'quit': {

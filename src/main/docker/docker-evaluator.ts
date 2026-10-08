@@ -13,24 +13,40 @@
 
 import * as fs from 'fs';
 import * as path from 'path';
-import { DockerPolicy, DockerMount, DockerNetworkPolicy, MountMode } from '../../shared/docker-policy';
-import { DockerRequest, DockerAction, classifyDockerRequest, containerIdFrom, imageRefFrom, networkIdFrom } from './docker-request';
+import {
+  DockerPolicy, DockerMount, DockerNetworkPolicy, MountMode, REPOSITORY_PATH, TAG, carriesRegistryHost, isRegistryHost,
+} from '../../shared/docker-policy';
+import { asciiEscaped, isPlainAscii } from '../../shared/json-keys';
+import type { ApprovedBind, PullRequest } from './docker-backend';
+import { digestHex } from '../vm/paths';
+import {
+  DockerRequest, DockerAction, classifyDockerRequest, containerIdFrom, imageRefFrom, mediaTypeOf, networkIdFrom,
+} from './docker-request';
 
 export interface DockerEvalContext {
   /** The bound policy; null until the worker claims a job, which denies all. */
   policy: DockerPolicy | null;
   /**
-   * The job workspace, absolute and already resolved through symlinks. Mount
-   * sources must resolve inside it; the evaluator does not resolve the root
-   * itself, so that a stubbed realpath in tests cannot move the boundary.
+   * The job's sandbox directory, resolved through symlinks once, when the
+   * socket started: the app made it, before the job existed. Every component
+   * of a mount source from here down is checked with lstat after the source is
+   * resolved, and a symlink among them is refused.
+   */
+  sandboxDir: string;
+  /**
+   * The job workspace: a directory below sandboxDir, joined to it literally
+   * and never resolved, since the job can replace any directory below
+   * sandboxDir with a link to anywhere and so move a root resolved through it.
+   * Mount sources must resolve inside it.
    */
   workspaceRoot: string;
-  /** Whether the backend may honour `privileged`. Stage 1: false. */
+  /** Whether the backend may honour `privileged`. The VM backend: false (owner decision 2). */
   supportsPrivileged: boolean;
   /**
    * Ids of containers created through this socket. Per-container reads and
-   * writes are permitted only against these: the daemon is shared with the
-   * operator and with other jobs, so an unscoped id reaches outside this job.
+   * writes are permitted only against these: a container the job did not
+   * create through this socket is one the filter never judged, and with a
+   * daemon the job shares (the Linux e2e forwarder) it is someone else's.
    */
   ownContainerIds?: ReadonlySet<string>;
   /**
@@ -41,6 +57,8 @@ export interface DockerEvalContext {
   ownNetworkIds?: ReadonlySet<string>;
   /** Injected for tests; defaults to fs.realpathSync. Must throw when the path does not exist. */
   realpath?: (p: string) => string;
+  /** Injected for tests; defaults to fs.lstatSync. Must throw when the path does not exist. */
+  lstat?: (p: string) => { isSymbolicLink(): boolean };
 }
 
 export interface DockerVerdict {
@@ -50,22 +68,43 @@ export interface DockerVerdict {
   /** The policy that would permit it, as YAML under `docker:` (for --updaterc discovery). */
   policyHint?: string;
   /**
-   * A create body whose mount sources are rewritten to the paths this verdict
-   * actually checked. Forwarding the spelling the client sent would let the
-   * daemon resolve it a second time, and the job can swap a symlink in the gap
-   * between the two resolutions; forwarding what was checked closes that.
+   * The body to forward in place of the bytes received: on any permitted
+   * request with a JSON body, the object this verdict judged, and on a create,
+   * one whose mount sources are rewritten to the paths it actually checked.
+   *
+   * Forwarding the bytes would let the daemon read what JSON.parse dropped: a
+   * key repeated exactly, which JSON.parse keeps only the last copy of, while
+   * Go decodes every copy in turn and a map or struct keeps what the earlier
+   * ones put there. And forwarding a mount source as the client spelled it
+   * would have the daemon resolve that spelling again, through whatever link
+   * the job had put on it since it was judged. The resolved path narrows that
+   * without closing it: the daemon resolves it once more when the container
+   * starts, so a directory on it the job replaces with a symlink after it is
+   * checked and before the container starts is followed. On the VM backend
+   * that gap is closed in the guest: the share is mounted nosymfollow, and
+   * lm-bindpin lets a container start only with the binds in approvedBinds.
    */
   rewrittenBody?: unknown;
+  /**
+   * On an allowed create, every bind it carries, as the guest's hook will
+   * match it (contract §3.7 "Bind matching"): the source exactly as pinned in
+   * rewrittenBody, the destination cleaned, and whether it is read-only.
+   * Empty when the create binds nothing; absent on anything else.
+   */
+  approvedBinds?: ApprovedBind[];
 }
 
 const ALLOW: DockerVerdict = { allowed: true };
 const deny = (reason: string, policyHint?: string): DockerVerdict =>
   policyHint === undefined ? { allowed: false, reason } : { allowed: false, reason, policyHint };
 
-/** Permitted with no declaration: every client needs them to start, and none reach the host. */
-// Reads that tell a client nothing about the host: every client needs them to
-// start. Container reads are NOT here - the baseline is reads about the job's
-// OWN containers, which is enforced per id below.
+/**
+ * Permitted with no declaration: every client needs them to start. /info in
+ * full describes the operator's machine, down to proxy credentials, so the
+ * filter proxy passes on only the few fields a client reads from it. Container
+ * reads are NOT here - the baseline is reads about the job's OWN containers,
+ * which is enforced per id below.
+ */
 const BASELINE: ReadonlySet<DockerAction> = new Set(['ping', 'version', 'info']);
 
 /**
@@ -109,7 +148,12 @@ const hints = {
     `docker:\n  run:\n    mounts:\n      - path: ${yamlString(relative)}\n        mode: ${mode}`,
   network: (mode: string) => `docker:\n  run:\n    network: ${yamlString(mode)}`,
   registry: (registry: string) => `docker:\n  pull:\n    registries:\n      - ${registry}`,
-  build: 'docker:\n  build:\n    context: "./"',
+  // A tagged build's hint names its tags too, so one --updaterc pass writes
+  // a policy that permits it rather than one that is refused for the tag.
+  build: (tags: string[]) =>
+    'docker:\n  build:\n    context: "./"' +
+    (tags.length ? `\n    tags:${tags.map((tag) => `\n      - ${yamlString(tag)}`).join('')}` : ''),
+  buildTag: (tag: string) => `docker:\n  build:\n    tags:\n      - ${yamlString(tag)}`,
   privileged: 'docker:\n  privileged: true',
   network_declaration: (name: string, internal: boolean) =>
     `docker:\n  run:\n    networks:\n      - name: ${yamlString(name)}\n        internal: ${internal}`,
@@ -126,10 +170,10 @@ function splitRegistry(reference: string): { registry: string; remainder: string
   const slash = reference.indexOf('/');
   if (slash === -1) return { registry: DEFAULT_REGISTRY, remainder: reference };
   const first = reference.slice(0, slash);
-  // A first component is a registry only when it looks like a host.
-  if (!first.includes('.') && !first.includes(':') && first !== 'localhost') {
-    return { registry: DEFAULT_REGISTRY, remainder: reference };
-  }
+  // A first component is a registry only when it looks like a host, which
+  // includes one with an uppercase letter (isRegistryHost): `LOCALHOST/x` and
+  // `Evil/x` are pulled from those hosts, not from docker.io.
+  if (!isRegistryHost(first)) return { registry: DEFAULT_REGISTRY, remainder: reference };
   const registry = first === 'index.docker.io' ? DEFAULT_REGISTRY : first;
   return { registry, remainder: reference.slice(slash + 1) };
 }
@@ -178,7 +222,7 @@ const oneOf = (...allowed: string[]) => (v: unknown): boolean => isUnset(v) || a
  * the grammar applies to itself: what cannot be named cannot be requested.
  *
  * These are the keys an ordinary `docker run` sends. Each is either inert
- * (resource limits, logging, restart behaviour) or gated below.
+ * (resource limits, removal on exit) or gated below.
  */
 const HOST_CONFIG_KNOWN: ReadonlySet<string> = new Set([
   // Gated below by value, or checked by the mount and network logic.
@@ -186,17 +230,53 @@ const HOST_CONFIG_KNOWN: ReadonlySet<string> = new Set([
   'pidmode', 'ipcmode', 'utsmode', 'usernsmode', 'cgroupnsmode', 'cgroupparent', 'cgroup',
   'devices', 'devicerequests', 'devicecgrouprules', 'securityopt', 'capadd', 'sysctls', 'runtime',
   'isolation', 'maskedpaths', 'readonlypaths', 'volumesfrom', 'extrahosts', 'groupadd', 'links',
-  'volumedriver',
+  'volumedriver', 'restartpolicy', 'logconfig', 'annotations',
   // Inert: they bound the container, they do not widen it. Dropping capabilities
   // and setting resource limits or DNS search only ever restricts.
-  'capdrop', 'autoremove', 'restartpolicy', 'logconfig', 'consolesize', 'readonlyrootfs', 'init',
+  'capdrop', 'autoremove', 'consolesize', 'readonlyrootfs', 'init',
   'oomscoreadj', 'oomkilldisable', 'shmsize', 'memory', 'memoryswap', 'memoryreservation',
   'memoryswappiness', 'kernelmemory', 'nanocpus', 'cpushares', 'cpuperiod', 'cpuquota',
   'cpurealtimeperiod', 'cpurealtimeruntime', 'cpusetcpus', 'cpusetmems', 'cpucount', 'cpupercent',
   'blkioweight', 'blkioweightdevice', 'blkiodevicereadbps', 'blkiodevicewritebps',
   'blkiodevicereadiops', 'blkiodevicewriteiops', 'pidslimit', 'dns', 'dnsoptions', 'dnssearch',
-  'annotations', 'tmpfs', 'ulimits', 'iomaximumbandwidth', 'iomaximumiops',
+  'tmpfs', 'ulimits', 'iomaximumbandwidth', 'iomaximumiops',
 ]);
+
+/** The fields of a RestartPolicy; anything else is a shape the filter cannot read. */
+const RESTART_POLICY_KNOWN: ReadonlySet<string> = new Set(['name', 'maximumretrycount']);
+
+/** Is a RestartPolicy one that never brings the container back? */
+const isNoRestart = (v: unknown): boolean => {
+  if (isUnset(v)) return true;
+  if (!isPlainObject(v)) return false;
+  if (Object.keys(v).some((key) => !RESTART_POLICY_KNOWN.has(key.toLowerCase()))) return false;
+  return valuesFor(v, 'Name').every((name) => isEmptyString(name) || name === 'no');
+};
+
+/**
+ * The log drivers that write to the VM's own disk. Every other driver - syslog,
+ * gelf, fluentd, splunk and the plugins - is run by dockerd in the guest's root
+ * network namespace and connects out from there, where the relay rule scoped
+ * to container interfaces does not apply. An internal network container's
+ * stdout reached the worker's proxy port that way.
+ */
+const LOG_DRIVERS: ReadonlySet<string> = new Set(['', 'json-file', 'local', 'none']);
+/** The local drivers' own options. Another driver's address option is refused with it. */
+const LOG_OPTIONS: ReadonlySet<string> = new Set(['max-size', 'max-file', 'compress', 'mode', 'max-buffer-size']);
+const LOG_CONFIG_KNOWN: ReadonlySet<string> = new Set(['type', 'config']);
+
+/** Is a LogConfig one that keeps the container's output on the VM's disk? */
+const isLocalLogging = (v: unknown): boolean => {
+  if (isUnset(v)) return true;
+  if (!isPlainObject(v)) return false;
+  if (Object.keys(v).some((key) => !LOG_CONFIG_KNOWN.has(key.toLowerCase()))) return false;
+  if (!valuesFor(v, 'Type').every((type) => isUnset(type) || (typeof type === 'string' && LOG_DRIVERS.has(type)))) {
+    return false;
+  }
+  // Options are a map[string]string the driver reads by exact key.
+  return valuesFor(v, 'Config').every((config) => isUnset(config) || (isPlainObject(config) &&
+    Object.entries(config).every(([key, value]) => LOG_OPTIONS.has(key) && typeof value === 'string')));
+};
 
 const HOST_CONFIG_GATES: ReadonlyArray<{ key: string; permitted: (v: unknown) => boolean; flag: string }> = [
   // The daemon writes the new container's id to this HOST path, so a non-empty
@@ -233,6 +313,16 @@ const HOST_CONFIG_GATES: ReadonlyArray<{ key: string; permitted: (v: unknown) =>
   { key: 'MaskedPaths', permitted: isUnset, flag: 'MaskedPaths' },
   { key: 'ReadonlyPaths', permitted: isUnset, flag: 'ReadonlyPaths' },
   { key: 'VolumesFrom', permitted: isEmptyArray, flag: '--volumes-from' },
+  // A restart policy is the daemon's promise to bring the container back:
+  // after it exits, and after the daemon itself restarts. With one, a
+  // container outlives the job and the removal that runs when it ends. The
+  // CLI sends "no", or "" from older versions, when --restart is not given.
+  { key: 'RestartPolicy', permitted: isNoRestart, flag: '--restart' },
+  { key: 'LogConfig', permitted: isLocalLogging, flag: '--log-driver/--log-opt' },
+  // OCI annotations reach runc and the containerd shim as an extension
+  // channel: org.systemd.property.* sets unit properties under the systemd
+  // cgroup driver, for one. The CLI sends none unless --annotation is given.
+  { key: 'Annotations', permitted: isEmptyObject, flag: '--annotation' },
 ];
 
 /** Bind options that do not change what the mount reaches. */
@@ -249,7 +339,21 @@ const PROPAGATIONS: ReadonlySet<string> = new Set(['', 'private', 'rprivate', 's
 interface MountRequest {
   /** The host source as the request gave it. */
   source: string;
+  /** Where it lands in the container, cleaned by cleanDestination. */
+  destination: string;
   mode: MountMode;
+}
+
+/**
+ * A container path as dockerd cleans it, and as the guest's hook compares it:
+ * `.`, `..` and repeated slashes resolved, and no trailing slash except on
+ * `/` itself. Undefined for anything that is not an absolute path, which no
+ * approval could match. See contract §3.7 "Bind matching".
+ */
+function cleanDestination(destination: unknown): string | undefined {
+  if (typeof destination !== 'string' || !path.posix.isAbsolute(destination)) return undefined;
+  const clean = path.posix.normalize(destination);
+  return clean.length > 1 && clean.endsWith('/') ? clean.slice(0, -1) : clean;
 }
 
 const inside = (root: string, p: string): boolean => p === root || p.startsWith(root + path.sep);
@@ -265,16 +369,20 @@ function parseBind(bind: string): MountRequest | string {
   const parts = bind.split(':');
   // "src:dst" or "src:dst:opts". A source with no slash is a named volume.
   if (parts.length < 2 || parts.length > 3) return `bind "${bind}" is not of the form source:target[:options]`;
-  const [source, , options] = parts;
+  const [source, target, options] = parts;
   if (!path.isAbsolute(source)) {
     return `"${source}" is a named volume, not a workspace path; only declared workspace mounts are permitted`;
+  }
+  const destination = cleanDestination(target);
+  if (destination === undefined) {
+    return `bind "${bind}" has the relative destination "${target}"; a destination in the container must be an absolute path`;
   }
   let mode: MountMode = 'rw';
   for (const option of options ? options.split(',') : []) {
     if (!BIND_OPTIONS.has(option)) return `bind option "${option}" on "${bind}" is not permitted`;
     if (option === 'ro') mode = 'ro';
   }
-  return { source, mode };
+  return { source, destination, mode };
 }
 
 /** Parse one entry of HostConfig.Mounts; null when it needs no host check. */
@@ -301,6 +409,10 @@ function parseMount(mount: unknown): MountRequest | string | null {
   if (typeof source !== 'string' || !path.isAbsolute(source)) {
     return 'a bind mount needs an absolute Source';
   }
+  const destination = cleanDestination(pick(mount, 'Target'));
+  if (destination === undefined) {
+    return 'a bind mount needs an absolute Target, its destination in the container';
+  }
   const options = pick(mount, 'BindOptions');
   if (options !== undefined && options !== null) {
     if (!isPlainObject(options)) return 'BindOptions must be an object';
@@ -311,7 +423,7 @@ function parseMount(mount: unknown): MountRequest | string | null {
   }
   // Any casing that says read-only counts; a mount is rw only when none does.
   const readOnly = valuesFor(mount, 'ReadOnly').some((v) => v === true);
-  return { source, mode: readOnly ? 'ro' : 'rw' };
+  return { source, destination, mode: readOnly ? 'ro' : 'rw' };
 }
 
 function collectMounts(hostConfig: Record<string, unknown>): MountRequest[] | string {
@@ -335,7 +447,33 @@ function collectMounts(hostConfig: Record<string, unknown>): MountRequest[] | st
       if (parsed) requests.push(parsed);
     }
   }
+  // dockerd refuses two mounts at one destination, and the guest's hook
+  // matches each mount to one approval by destination among the rest, so
+  // one approval could otherwise be claimed twice.
+  const destinations = new Set<string>();
+  for (const { destination } of requests) {
+    if (destinations.has(destination)) {
+      return `more than one mount has the destination "${destination}" in the container`;
+    }
+    destinations.add(destination);
+  }
   return requests;
+}
+
+/**
+ * The first of `anchor` and each directory from it down to `target` that is a
+ * symlink, or undefined when none is. Throws when one does not exist.
+ */
+function symlinkOnPath(
+  anchor: string,
+  target: string,
+  lstat: (p: string) => { isSymbolicLink(): boolean }
+): string | undefined {
+  const dirs = [anchor];
+  for (const component of path.relative(anchor, target).split(path.sep)) {
+    if (component !== '') dirs.push(path.join(dirs[dirs.length - 1], component));
+  }
+  return dirs.find((dir) => lstat(dir).isSymbolicLink());
 }
 
 /** A declared mount permits a source at or below its path, at or below its mode. */
@@ -349,14 +487,16 @@ function checkMounts(
   hostConfig: Record<string, unknown>,
   ctx: DockerEvalContext,
   declared: DockerMount[],
-  resolutions?: Map<string, string>
+  resolutions?: Map<string, string>,
+  approved?: ApprovedBind[]
 ): DockerVerdict {
   const requests = collectMounts(hostConfig);
   if (typeof requests === 'string') return deny(requests);
   const realpath = ctx.realpath ?? ((p: string) => fs.realpathSync(p));
+  const lstat = ctx.lstat ?? ((p: string) => fs.lstatSync(p));
   const root = ctx.workspaceRoot;
 
-  for (const { source, mode } of requests) {
+  for (const { source, destination, mode } of requests) {
     // Resolve before deciding, so `../` and symlinks are judged by where they
     // land, not how they are spelled. A source that does not exist cannot be
     // judged at all, and the daemon would create it on the host.
@@ -366,8 +506,20 @@ function checkMounts(
     } catch {
       return deny(`mount source "${source}" could not be resolved; create it inside the workspace first`);
     }
-    if (!inside(root, resolved)) {
+    if (!inside(root, resolved) || !inside(ctx.sandboxDir, resolved)) {
       return deny(`mount source "${source}" is outside the job workspace and cannot be permitted by policy`);
+    }
+    // What realpath answered held when it answered. Check it still does, one
+    // component at a time from the sandbox directory down, without following
+    // any: a link among them now is one the job put there since.
+    let link: string | undefined;
+    try {
+      link = symlinkOnPath(ctx.sandboxDir, resolved, lstat);
+    } catch {
+      return deny(`mount source "${source}" could not be resolved; create it inside the workspace first`);
+    }
+    if (link !== undefined) {
+      return deny(`mount source "${source}" passes through "${link}", a symlink; the job workspace changed while the mount was judged`);
     }
     if (!declared.some((m) => declaredMountPermits(m, root, resolved, mode))) {
       const relative = relativeTo(root, resolved);
@@ -377,6 +529,9 @@ function checkMounts(
       );
     }
     resolutions?.set(source, resolved);
+    // The source as pinnedMountSources will forward it, so the hook in the
+    // guest compares what dockerd was actually sent.
+    approved?.push({ source: resolved, destination, readOnly: mode === 'ro' });
   }
   return ALLOW;
 }
@@ -439,12 +594,14 @@ function evaluateCreate(req: DockerRequest, ctx: DockerEvalContext, policy: Dock
   if (privilegedValues.some((v) => v === true)) {
     if (!policy.privileged) {
       return deny(
-        'privileged containers are not declared in the repository docker policy; `privileged: true` requires a managed VM backend',
+        ctx.supportsPrivileged
+          ? 'privileged containers are not declared in the repository docker policy'
+          : "privileged containers are not granted: they reach the Docker VM's kernel",
         ctx.supportsPrivileged ? hints.privileged : undefined
       );
     }
     if (!ctx.supportsPrivileged) {
-      return deny('the repository docker policy declares privileged, which requires a managed VM backend; this daemon is not one');
+      return deny("privileged containers are not granted: they reach the Docker VM's kernel");
     }
   } else if (privilegedValues.some((v) => !isUnset(v) && v !== false)) {
     return deny('HostConfig.Privileged must be a boolean');
@@ -490,7 +647,8 @@ function evaluateCreate(req: DockerRequest, ctx: DockerEvalContext, policy: Dock
     if (isUnset(rawMode) || rawMode === '' || rawMode === 'default') candidate = 'bridge';
     else if (typeof rawMode === 'string') candidate = rawMode;
     else return deny('HostConfig.NetworkMode must be a string');
-    if (candidate === 'host' || candidate.startsWith('container:')) {
+    const candidateMode = candidate.toLowerCase();
+    if (candidateMode === 'host' || candidateMode.startsWith('container:')) {
       return deny(`--network=${candidate} (HostConfig.NetworkMode) reaches the host and cannot be permitted by policy`);
     }
     // The most restrictive reading wins when casings disagree.
@@ -506,21 +664,105 @@ function evaluateCreate(req: DockerRequest, ctx: DockerEvalContext, policy: Dock
     );
   }
 
+  // The other way a container joins a network at create. NetworkMode names one;
+  // NetworkingConfig.EndpointsConfig names any number, and the daemon attaches
+  // all of them - so it is held to the same rule rather than left as a way to
+  // reach a network the rule above refuses. A job may still join what it
+  // created, which is what a container bridging two of its own networks needs.
+  for (const networkingConfig of valuesFor(body, 'NetworkingConfig')) {
+    if (isUnset(networkingConfig)) continue;
+    if (!isPlainObject(networkingConfig)) return deny('NetworkingConfig must be an object');
+    for (const endpoints of valuesFor(networkingConfig, 'EndpointsConfig')) {
+      if (isUnset(endpoints)) continue;
+      if (!isPlainObject(endpoints)) return deny('NetworkingConfig.EndpointsConfig must be an object');
+      for (const key of Object.keys(endpoints)) {
+        // "default" is what the CLI actually puts here for a plain `docker
+        // run`, and an empty name means the same: the daemon default, bridge.
+        // NetworkMode normalises both already; this must too, or every
+        // ordinary run is refused.
+        const name = key === '' || key === 'default' ? 'bridge' : key;
+        const specialMode = name.toLowerCase();
+        if (specialMode === 'host' || specialMode.startsWith('container:')) {
+          return deny(
+            `--network=${name} (NetworkingConfig.EndpointsConfig) reaches the host and cannot be permitted by policy`
+          );
+        }
+        if (name !== 'none' && name !== policy.run.network && !ctx.ownNetworkIds?.has(name)) {
+          return deny(
+            `network "${name}" (NetworkingConfig.EndpointsConfig) is not declared in the repository docker policy (run.network)`,
+            hints.network(name)
+          );
+        }
+
+        // The key is only half of it. For a user-defined key, moby's
+        // getNetworkID prefers the entry's NetworkID over the key, and resolves
+        // it as a name, id or id prefix - so an owned key carrying a foreign
+        // NetworkID joins the foreign network while every check here sees the
+        // owned name. Only an empty NetworkID, or one naming the key itself,
+        // means what the key says.
+        const endpoint = endpoints[key];
+        if (isUnset(endpoint)) continue;
+        if (!isPlainObject(endpoint)) {
+          return deny(`NetworkingConfig.EndpointsConfig["${key}"] must be an object`);
+        }
+        for (const networkId of valuesFor(endpoint, 'NetworkID')) {
+          if (isUnset(networkId) || networkId === '' || networkId === key) continue;
+          return deny(
+            `NetworkingConfig.EndpointsConfig["${key}"].NetworkID names a different network than its key; ` +
+              'the daemon would join that network instead, which the policy does not grant'
+          );
+        }
+      }
+    }
+  }
+
   // Pin every mount source to the path that was actually checked, so the
-  // daemon mounts what the filter judged rather than re-resolving a name the
-  // job can point somewhere else in between.
+  // daemon is sent what the filter judged rather than a name the job can
+  // point somewhere else in between. The daemon still resolves that path
+  // again when the container starts (see rewrittenBody), which is why each
+  // one is also approved for the guest's hook by exactly that path.
   const resolutions = new Map<string, string>();
-  const verdict = checkMounts(hostConfig, ctx, policy.run.mounts ?? [], resolutions);
-  if (!verdict.allowed || resolutions.size === 0) return verdict;
-  return { allowed: true, rewrittenBody: pinMountSources(body, resolutions) };
+  const approvedBinds: ApprovedBind[] = [];
+  const verdict = checkMounts(hostConfig, ctx, policy.run.mounts ?? [], resolutions, approvedBinds);
+  if (!verdict.allowed) return verdict;
+  if (resolutions.size === 0) return { allowed: true, approvedBinds };
+  return { allowed: true, rewrittenBody: pinMountSources(body, resolutions), approvedBinds };
 }
 
+/**
+ * The value of the query parameter whose name case-insensitively equals
+ * `name`. Podman decodes the query with gorilla/schema, which matches a name
+ * in any case, so a parameter the filter refuses on must be read in every
+ * casing, not the one moby reads. There is at most one such key: the parser
+ * refuses a query that repeats a name in any case.
+ */
+function queryValue(query: Record<string, string>, name: string): string | undefined {
+  const wanted = name.toLowerCase();
+  const key = Object.keys(query).find((k) => k.toLowerCase() === wanted);
+  return key === undefined ? undefined : query[key];
+}
+
+/** A digest, by distribution/reference's grammar: algorithm ":" hex. */
+const DIGEST = /^[A-Za-z][A-Za-z0-9]*(?:[-_+.][A-Za-z][A-Za-z0-9]*)*:[0-9a-fA-F]{32,}$/;
+
 function evaluatePull(req: DockerRequest, policy: DockerPolicy): DockerVerdict {
+  // fromImage is read in moby's spelling only: moby ignores any other, so a
+  // lone differently-cased one leaves this undefined and the pull is refused.
   const fromImage = req.query.fromImage;
-  if (req.query.fromSrc !== undefined) {
+  if (queryValue(req.query, 'fromSrc') !== undefined) {
     return deny('importing an image (fromSrc) is not permitted; only pulls from a declared registry are');
   }
   if (!fromImage) return deny('image pull requires fromImage');
+  // The registry is judged from fromImage alone, which holds only while the
+  // tag cannot change it. moby parses the tag on its own and refuses one that
+  // is not a tag or a digest; Podman appends it to fromImage with ":" (in any
+  // casing of the name), so `localhost` with tag `5000/x` is a pull from
+  // localhost:5000. Neither grammar has a "/" or an "@", so a tag or digest
+  // leaves the name, and with it the registry, as it was judged.
+  const tag = queryValue(req.query, 'tag');
+  if (tag !== undefined && tag !== '' && !TAG.test(tag) && !DIGEST.test(tag)) {
+    return deny(`pull tag "${asciiEscaped(tag)}" is neither a tag nor a digest, and could name another image or registry`);
+  }
   const registry = registryOf(fromImage);
   if (!policy.pull) {
     return deny('the repository docker policy declares no pull action', hints.registry(registry));
@@ -534,6 +776,75 @@ function evaluatePull(req: DockerRequest, policy: DockerPolicy): DockerVerdict {
   return ALLOW;
 }
 
+/** The platforms a pull may ask for: what the VM runs, natively or through Rosetta (contract §6.2). */
+const PULL_PLATFORM = /^linux\/(?:arm64|amd64)(?:\/v[0-9])?$/;
+
+/**
+ * What an allowed pull asks for, read exactly as evaluatePull judged it: the
+ * registry by the daemon's rule (registryOf), the repository path with
+ * Docker Hub's `library/` for a single name, and the tag or digest from
+ * fromImage or, taking precedence as the daemon's does, the tag parameter.
+ * The filter pulls this on the Mac instead of forwarding the request. A
+ * string when the reference cannot be read as one image.
+ */
+export function pullRequestOf(query: Record<string, string>): PullRequest | string {
+  const fromImage = query.fromImage;
+  if (!fromImage) return 'image pull requires fromImage';
+  const { registry, remainder } = splitRegistry(fromImage);
+  let name = remainder;
+  let tag: string | undefined;
+  let digest: string | undefined;
+  const at = name.indexOf('@');
+  if (at !== -1) {
+    digest = name.slice(at + 1);
+    name = name.slice(0, at);
+    // `name:tag@digest`: the digest names the image, and the docker CLI
+    // ignores the tag, as the daemon does.
+    const colon = name.lastIndexOf(':');
+    if (colon > name.lastIndexOf('/')) name = name.slice(0, colon);
+  } else {
+    const colon = name.lastIndexOf(':');
+    if (colon > name.lastIndexOf('/')) {
+      tag = name.slice(colon + 1);
+      name = name.slice(0, colon);
+    }
+  }
+  const queryTag = queryValue(query, 'tag');
+  if (queryTag !== undefined && queryTag !== '') {
+    if (DIGEST.test(queryTag)) {
+      digest = queryTag;
+      tag = undefined;
+    } else {
+      tag = queryTag;
+    }
+  }
+  if (registry === DEFAULT_REGISTRY && !name.includes('/')) name = `library/${name}`;
+  if (!REPOSITORY_PATH.test(name)) return `"${asciiEscaped(fromImage)}" is not an image name localmost can pull`;
+  if (tag !== undefined && !TAG.test(tag)) return `pull tag "${asciiEscaped(tag)}" is not a tag`;
+  if (digest !== undefined && !DIGEST.test(digest)) return `pull digest "${asciiEscaped(digest)}" is not a digest`;
+  // A digest the job chose is outside input, and the Mac-side store builds
+  // paths from it: only the one form contract §1 allows goes on.
+  if (digest !== undefined && digestHex(digest) === null) {
+    return `only sha256 digests can be pulled, not "${asciiEscaped(digest.slice(0, 100))}"`;
+  }
+  if (tag === undefined && digest === undefined) tag = 'latest';
+  const requestedPlatform = queryValue(query, 'platform');
+  let platform: string | undefined;
+  if (requestedPlatform) {
+    platform = requestedPlatform.toLowerCase();
+    if (!PULL_PLATFORM.test(platform)) {
+      return `localmost's Docker VM runs linux/arm64 and linux/amd64 images, not "${asciiEscaped(requestedPlatform.slice(0, 64))}"`;
+    }
+  }
+  return {
+    registry,
+    repositoryPath: name,
+    ...(tag !== undefined ? { tag } : {}),
+    ...(digest !== undefined ? { digest } : {}),
+    ...(platform ? { platform } : {}),
+  };
+}
+
 /**
  * Build query parameters the filter understands.
  *
@@ -545,8 +856,15 @@ function evaluatePull(req: DockerRequest, policy: DockerPolicy): DockerVerdict {
 const BUILD_PARAMS_KNOWN: ReadonlySet<string> = new Set([
   't', 'dockerfile', 'q', 'nocache', 'rm', 'forcerm', 'pull', 'buildargs', 'labels', 'target',
   'shmsize', 'memory', 'memswap', 'cpushares', 'cpusetcpus', 'cpuperiod', 'cpuquota', 'squash',
-  'platform', 'version', 'buildid', 'session',
+  'platform', 'version', 'buildid',
 ]);
+
+/**
+ * The builder versions a build may ask for: the classic builder's, or none.
+ * `version=2` selects dockerd's BuildKit builder on a plain tar context, with
+ * no /session or /grpc call for the "buildkit" refusal to catch.
+ */
+const CLASSIC_BUILDER_VERSIONS: ReadonlySet<string> = new Set(['', '1']);
 
 /** Keys a network create may carry freely: they name the network or are inert. */
 const NETWORK_CREATE_KNOWN: ReadonlySet<string> = new Set(['name', 'internal', 'checkduplicate', 'labels', 'driver']);
@@ -664,11 +982,104 @@ function evaluateOwnNetwork(req: DockerRequest, ctx: DockerEvalContext): DockerV
   const id = networkIdFrom(req);
   if (!id) return deny(`${req.method} ${req.path} is not permitted through the localmost docker socket`);
   if (ctx.ownNetworkIds?.has(id)) return ALLOW;
+  // Deliberately no exception for the policy's declared network. Inspecting it
+  // reads as harmless - a job is already on that network, and wanting its
+  // gateway is reasonable - but the response carries a Containers map naming
+  // every container attached, with addresses. On a shared network like bridge
+  // that is other jobs' containers and the operator's own, which no policy
+  // here grants and which the job cannot otherwise see. The convenience is not
+  // worth a cross-job disclosure.
   return deny(`network "${id}" was not created through this job's docker socket`);
 }
 
+/** The repository part of a normalised reference: everything before its tag or digest. */
+function repositoryOf(normalized: string): string {
+  const at = normalized.indexOf('@');
+  const name = at === -1 ? normalized : normalized.slice(0, at);
+  const colon = name.lastIndexOf(':');
+  return colon > name.lastIndexOf('/') ? name.slice(0, colon) : name;
+}
+
+/** The repositories run.images names, lowercased, as globs a tag's repository is matched against. */
+const runRepositoriesOf = (policy: DockerPolicy): string[] =>
+  (policy.run?.images ?? []).map((image) => repositoryOf(normalizeImage(image)).toLowerCase());
+
+/** Why a build tag is refused whatever build.tags says, or undefined when a build.tags entry could permit it. */
+function unpermittableTag(tag: string, runRepositories: string[]): string | undefined {
+  const shown = asciiEscaped(tag.slice(0, 256));
+  if (tag === '' || tag.includes('@')) {
+    return `build tag "${shown}" is not a name and tag; a build can be tagged only name[:tag]`;
+  }
+  if (carriesRegistryHost(tag)) {
+    return `build tag "${shown}" names a registry host; a build may tag its image only with a local name, ` +
+      'which no policy line can widen';
+  }
+  const repository = repositoryOf(normalizeImage(tag)).toLowerCase();
+  if (runRepositories.some((declaredRepository) => globMatches(declaredRepository, repository))) {
+    return `build tag "${shown}" names an image the repository docker policy runs (run.images); ` +
+      'a build may not replace it, whatever build.tags declares';
+  }
+  // Held to distribution/reference's grammar, as a pull's name is, so that
+  // a tag is matched against build.tags only in the spelling the daemon
+  // would give it.
+  const { remainder } = splitRegistry(tag);
+  const colon = remainder.lastIndexOf(':');
+  const hasTag = colon > remainder.lastIndexOf('/');
+  if (!REPOSITORY_PATH.test(hasTag ? remainder.slice(0, colon) : remainder) || (hasTag && !TAG.test(remainder.slice(colon + 1)))) {
+    return `build tag "${shown}" is not a name and tag; a build can be tagged only name[:tag]`;
+  }
+  return undefined;
+}
+
+/**
+ * Judge every tag a build asks for (`t`, which repeats for `-t a -t b`).
+ *
+ * A build's tag replaces any local image of that name, and a later run of that
+ * name uses it without a pull. So a tag is held to build.tags, and two kinds
+ * are refused whatever build.tags says, with no hint, since no policy line
+ * can permit them:
+ *
+ * - a tag carrying a registry host: the image was never fetched from there,
+ *   and a later push or run by that name would take it for the registry's;
+ * - a tag in a repository run.images names, in any case and with or without a
+ *   tag: run.images is what an approver reads as "the image the job runs",
+ *   and a build tagged postgres:16 would be run in its place. Compared
+ *   case-insensitively because the comparison guards a name, not a lookup: a
+ *   spelling the daemon refuses costs nothing to refuse here too.
+ *
+ * A build with no tag names no image and needs no entry.
+ */
+function judgeBuildTags(req: DockerRequest, policy: DockerPolicy): DockerVerdict {
+  // moby reads `t` by its exact name and ignores any other casing; Podman's
+  // decoder reads every casing as the tag list. One the filter does not read
+  // as a tag must not reach a daemon that does.
+  const misspelled = Object.keys(req.query).find((key) => key.toLowerCase() === 't' && key !== 't');
+  if (misspelled !== undefined) {
+    return deny(`build parameter "${misspelled}" is not read as a tag by every daemon; spell it "t"`);
+  }
+  const declared = policy.build?.tags ?? [];
+  const runRepositories = runRepositoriesOf(policy);
+  for (const tag of req.queryLists.t ?? []) {
+    const refused = unpermittableTag(tag, runRepositories);
+    if (refused !== undefined) return deny(refused);
+    if (!declared.some((entry) => globMatches(normalizeImage(entry), normalizeImage(tag)))) {
+      return deny(
+        `build tag "${asciiEscaped(tag.slice(0, 256))}" is not declared in the repository docker policy (build.tags)`,
+        hints.buildTag(tag)
+      );
+    }
+  }
+  return ALLOW;
+}
+
 function evaluateBuild(req: DockerRequest, policy: DockerPolicy): DockerVerdict {
-  if (!policy.build) return deny('the repository docker policy declares no build action', hints.build);
+  if (!policy.build) {
+    // The hint names each tag a build.tags entry could permit, so that the
+    // policy it writes does not refuse the same build again for its tags.
+    const runRepositories = runRepositoriesOf(policy);
+    const tags = [...new Set(req.queryLists.t ?? [])].filter((tag) => unpermittableTag(tag, runRepositories) === undefined);
+    return deny('the repository docker policy declares no build action', hints.build(tags));
+  }
   // The Engine API carries the context as a tar the client assembled from
   // inside its sandbox. A remote context would have the daemon fetch it
   // itself - from the network, or from its own filesystem - which is the
@@ -683,14 +1094,24 @@ function evaluateBuild(req: DockerRequest, policy: DockerPolicy): DockerVerdict 
     if (!BUILD_PARAMS_KNOWN.has(name)) {
       return deny(`build parameter "${key}" is not one the localmost docker socket understands, so it cannot be forwarded`);
     }
+    if (name === 'version' && !CLASSIC_BUILDER_VERSIONS.has(req.query[key])) {
+      return deny(
+        `build version "${asciiEscaped(req.query[key].slice(0, 16))}" selects BuildKit, which cannot be filtered; ` +
+          'jobs are pinned to the classic builder (version 1)'
+      );
+    }
   }
+
+  const tagged = judgeBuildTags(req, policy);
+  if (!tagged.allowed) return tagged;
 
   // A build runs containers, and its network is chosen here rather than in a
   // HostConfig - so the same rule the run path applies has to apply here too,
   // or `docker build --network host` walks through a door create keeps shut.
-  const rawMode = req.query.networkmode ?? req.query.NetworkMode;
+  const rawMode = queryValue(req.query, 'networkmode');
   if (rawMode !== undefined && rawMode !== '' && rawMode !== 'default') {
-    if (rawMode === 'host' || rawMode.startsWith('container:')) {
+    const rawModeLower = rawMode.toLowerCase();
+    if (rawModeLower === 'host' || rawModeLower.startsWith('container:')) {
       return deny(`--network=${rawMode} on a build reaches the host and cannot be permitted by policy`);
     }
     if (rawMode !== 'none' && rawMode !== policy.run?.network) {
@@ -728,7 +1149,30 @@ function evaluateOwnContainer(req: DockerRequest, ctx: DockerEvalContext): Docke
 // -----------------------------------------------------------------------------
 
 /**
- * The first key in `value` that has a case-variant twin, named with its path.
+ * How deep a body may nest. A create's deepest real path -
+ * HostConfig.Mounts[].VolumeOptions.DriverConfig.Options - is six levels; a
+ * body far deeper is no Docker request, and walking it recursively would
+ * overflow the stack inside the request handler, which then never answers.
+ */
+const MAX_BODY_DEPTH = 32;
+
+/**
+ * The first key in `value` the daemon could read as a key this filter does
+ * not, named with its path: one that is not printable ASCII, or one that has
+ * a case-variant twin.
+ *
+ * Beyond ASCII case, Go's decoder folds some other letters to ASCII ones: it
+ * reads U+017F (long s) as `s`, escaped or not, so `HoſtConfig` is HostConfig
+ * to the daemon and an unknown key to every lookup here. Top-level keys are
+ * not an allowlist, and most nested objects are read only by name, so such a
+ * key carried privileged, a root bind or a mount propagation past every gate.
+ * Rather than copy Go's fold, which would have to be right for every letter
+ * and every future version, any key outside printable ASCII is refused, at
+ * every depth. The CLI writes its own keys in ASCII, and values - an
+ * environment variable, a label's value - are not checked. A key the job names
+ * itself, such as a label or a container path under Volumes, is refused too
+ * when it is not ASCII: the price of not modelling which objects are structs
+ * the daemon folds and which are maps it does not.
  *
  * Measured against a real daemon rather than reasoned about: a create body
  * carrying `HostConfig`, `hostconfig` and `HOSTCONFIG` came back with fields
@@ -741,34 +1185,92 @@ function evaluateOwnContainer(req: DockerRequest, ctx: DockerEvalContext): Docke
  * So the ambiguity is refused instead of modelled. Go's encoder emits unique,
  * exactly-cased keys, so no real client sends a case-variant duplicate; a body
  * that does is either a client the filter does not model or an attempt to be
- * judged on one value and served another.
+ * judged on one value and served another. A key repeated exactly cannot be
+ * seen here - JSON.parse has already kept only its last copy - so the daemon
+ * is sent the parsed body instead of the bytes (see rewrittenBody).
+ *
+ * The walk recurses, so a body nested deeper than MAX_BODY_DEPTH is refused
+ * before it can exhaust the stack; `at` is the path from the body's root.
  */
-function caseAmbiguity(value: unknown, at = 'the request body'): string | undefined {
+function keyAmbiguity(value: unknown, at = '', depth = 0): string | undefined {
+  if (!Array.isArray(value) && !isPlainObject(value)) return undefined;
+  const where = at === '' ? 'the request body' : `the request body at ${at}`;
+  if (depth >= MAX_BODY_DEPTH) {
+    return `${where} is nested more than ${MAX_BODY_DEPTH} levels deep, deeper than any Docker API body; the localmost docker socket refuses it rather than walk it.`;
+  }
   if (Array.isArray(value)) {
     for (const [i, item] of value.entries()) {
-      const found = caseAmbiguity(item, `${at}[${i}]`);
+      const found = keyAmbiguity(item, `${at}[${i}]`, depth + 1);
       if (found) return found;
     }
     return undefined;
   }
-  if (!isPlainObject(value)) return undefined;
   const seen = new Map<string, string>();
   for (const key of Object.keys(value)) {
+    // Every key is checked before any is used in a path below, so `at` only
+    // ever names keys that passed.
+    if (!isPlainAscii(key)) {
+      return `${where} has a key "${asciiEscaped(key)}" that is not plain ASCII, which the daemon may read as another key: its decoder folds some other letters to ASCII ones, so the value it would use is not one this filter can read. Spell every key in ASCII.`;
+    }
     const folded = key.toLowerCase();
     const first = seen.get(folded);
     if (first !== undefined) {
-      return `${at} names both "${first}" and "${key}", which the daemon reads as the same key: it decodes them case-insensitively and merges or overwrites, so the value it would use is not the value this filter can read. Send each key once.`;
+      return `${where} names both "${first}" and "${key}", which the daemon reads as the same key: it decodes them case-insensitively and merges or overwrites, so the value it would use is not the value this filter can read. Send each key once.`;
     }
     seen.set(folded, key);
   }
   for (const [key, child] of Object.entries(value)) {
-    const found = caseAmbiguity(child, `${at}.${key}`);
+    const found = keyAmbiguity(child, at === '' ? key : `${at}.${key}`, depth + 1);
     if (found) return found;
   }
   return undefined;
 }
 
+/**
+ * The media types each action's body may be sent as; anything else is
+ * refused.
+ *
+ * The daemon's Go server reads parameters from a form body as well as from the
+ * URL, and FormValue prefers the body's: sent as
+ * application/x-www-form-urlencoded or multipart/form-data, a pull could take
+ * its `fromImage` and a build its `networkmode` from a body this filter
+ * streams through unread. So each action names the types Go never reads as a
+ * form: JSON for the two bodies the filter judges; a tar for a build context
+ * (x-tar from the CLI, tar from docker-py and dockerode), or none; and for
+ * every other action no type, or text/plain, which the CLI labels an empty
+ * attach with (and older CLIs every empty POST).
+ */
+const NO_BODY_MEDIA_TYPES: ReadonlySet<string> = new Set(['', 'text/plain']);
+const BODY_MEDIA_TYPES: Partial<Record<DockerAction, ReadonlySet<string>>> = {
+  create: new Set(['application/json']),
+  'network-create': new Set(['application/json']),
+  build: new Set(['application/x-tar', 'application/tar', '']),
+};
+
+function unexpectedMediaType(action: DockerAction, req: DockerRequest): string | undefined {
+  const type = mediaTypeOf(req);
+  if ((BODY_MEDIA_TYPES[action] ?? NO_BODY_MEDIA_TYPES).has(type)) return undefined;
+  return `content type "${asciiEscaped(type)}" is not one the localmost docker socket accepts on ${req.method} ${req.path}: the daemon could read parameters from such a body that this filter does not`;
+}
+
+/**
+ * The first query parameter named outside printable ASCII. The daemon reads
+ * its parameters by exact name, so none of these is one it knows; like a
+ * body key, it is refused rather than forwarded unexamined.
+ */
+function nonAsciiParam(query: Record<string, string>): string | undefined {
+  const key = Object.keys(query).find((name) => !isPlainAscii(name));
+  return key === undefined
+    ? undefined
+    : `query parameter "${asciiEscaped(key)}" is not plain ASCII; the localmost docker socket reads parameters by their ASCII names only`;
+}
+
 export function evaluateDockerRequest(req: DockerRequest, ctx: DockerEvalContext): DockerVerdict {
+  // A target the parser could not read one way - an authority, a fragment, a
+  // query another daemon decodes differently - is a request the filter cannot
+  // judge, whatever it would otherwise be. The proxy answers these with a 400
+  // before asking; refusing here too keeps the evaluator whole on its own.
+  if (req.targetError) return deny(req.targetError);
   const action = classifyDockerRequest(req);
   if (BASELINE.has(action)) return ALLOW;
 
@@ -779,10 +1281,23 @@ export function evaluateDockerRequest(req: DockerRequest, ctx: DockerEvalContext
   if (req.bodyError) return deny(req.bodyError);
 
   // Nor can it judge a body whose keys the daemon would read differently than
-  // it does. Checked once, here, so every action with a body is covered.
-  const ambiguous = caseAmbiguity(req.body);
+  // it does, a parameter it does not know, or a body the daemon could read
+  // parameters from. Checked once, here, so every action with a body or a
+  // query string is covered.
+  const ambiguous = keyAmbiguity(req.body) ?? nonAsciiParam(req.query) ?? unexpectedMediaType(action, req);
   if (ambiguous) return deny(ambiguous);
 
+  const verdict = judge(action, req, ctx, policy);
+  // A permitted JSON body goes to the daemon as the object judged, never as
+  // the bytes it arrived as (see rewrittenBody).
+  if (verdict.allowed && req.body !== undefined && verdict.rewrittenBody === undefined) {
+    return { ...verdict, rewrittenBody: req.body };
+  }
+  return verdict;
+}
+
+/** The verdict on a request whose body and query every action can read. */
+function judge(action: DockerAction, req: DockerRequest, ctx: DockerEvalContext, policy: DockerPolicy): DockerVerdict {
   switch (action) {
     case 'create':
       return evaluateCreate(req, ctx, policy);

@@ -60,7 +60,8 @@ describe('auto-updater', () => {
 
     // Reset autoUpdater state - remove all listeners so initAutoUpdater can re-register
     mockAutoUpdater.removeAllListeners();
-    mockAutoUpdater.autoDownload = true;
+    // The opposite of what initAutoUpdater sets, so each setting is proven.
+    mockAutoUpdater.autoDownload = false;
     mockAutoUpdater.autoInstallOnAppQuit = false;
     (mockAutoUpdater.checkForUpdates as jest.Mock).mockClear();
     (mockAutoUpdater.downloadUpdate as jest.Mock).mockClear();
@@ -104,10 +105,10 @@ describe('auto-updater', () => {
       expect(status.currentVersion).toBe('1.0.0');
     });
 
-    it('should disable autoDownload', () => {
+    it('should enable autoDownload, so an update a check finds downloads without a click', () => {
       initAutoUpdater(mockMainWindow as unknown as BrowserWindow);
 
-      expect(mockAutoUpdater.autoDownload).toBe(false);
+      expect(mockAutoUpdater.autoDownload).toBe(true);
     });
 
     it('should enable autoInstallOnAppQuit', () => {
@@ -301,6 +302,28 @@ describe('auto-updater', () => {
       await checkForUpdates();
 
       expect(mockAutoUpdater.checkForUpdates).toHaveBeenCalled();
+    });
+
+    it('should leave no unhandled rejection when the automatic download fails', async () => {
+      // With autoDownload on, the check starts the download and returns its
+      // promise; electron-updater reports a failure through 'error' and also
+      // rejects that promise.
+      mockAutoUpdater.checkForUpdates.mockImplementation(async () => ({
+        downloadPromise: Promise.reject(new Error('download failed')),
+      }));
+      const unhandled = jest.fn();
+      process.on('unhandledRejection', unhandled);
+      try {
+        await checkForUpdates();
+        // Node reports an unobserved rejection after the microtask queue drains.
+        await new Promise((resolve) => setImmediate(resolve));
+        await new Promise((resolve) => setImmediate(resolve));
+      } finally {
+        process.off('unhandledRejection', unhandled);
+        mockAutoUpdater.checkForUpdates.mockReset();
+      }
+
+      expect(unhandled).not.toHaveBeenCalled();
     });
   });
 

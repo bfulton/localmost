@@ -1,7 +1,8 @@
 /**
  * CLI Test Command
  *
- * Runs GitHub Actions workflows locally before pushing.
+ * Runs GitHub Actions workflows locally before pushing, each job's steps
+ * in a fresh macOS VM from localmost's golden image (see test-vm.ts).
  *
  * Usage:
  *   localmost test                              # Run default workflow
@@ -12,7 +13,7 @@
 
 import * as fs from 'fs';
 import * as path from 'path';
-import { execSync } from 'child_process';
+import * as crypto from 'crypto';
 import {
   parseWorkflowFile,
   findDefaultWorkflow,
@@ -33,21 +34,31 @@ import {
 import {
   executeStep,
   ExecutionContext,
+  RUNNER_TEMP_DIR,
+  RUNNER_TOOL_CACHE_DIR,
   StepResult,
+  StepRunner,
   StepStatus,
+  withoutReservedEnv,
 } from '../shared/step-executor';
+import { dryRunRunner, openVmStepRunner } from './test-vm';
 import {
   findLocalmostrc,
+  LOCALMOSTRC_FILENAME,
   parseLocalmostrc,
   getEffectivePolicy,
+  hostPatternProblem,
   LocalmostrcConfig,
   serializeLocalmostrc,
+  unreadLocalmostrcNote,
+  writeLocalmostrc,
   LOCALMOSTRC_VERSION,
 } from '../shared/localmostrc';
-import { SandboxPolicy, parseSandboxTrace } from '../shared/sandbox-profile';
+import type { PolicyRules } from '../shared/policy-types';
 import { DockerPolicy, diffDockerPolicy, mergeDockerPolicy, parseDockerPolicyHint } from '../shared/docker-policy';
 import { DiscoveryProxy } from '../shared/discovery-proxy';
 import { createWorkspace, cleanupWorkspaces, getGitInfo, getRepositoryFromDir } from '../shared/workspace';
+import { getAppDataDirWithoutElectron } from '../shared/paths';
 import {
   detectLocalEnvironment,
   compareEnvironments,
@@ -66,7 +77,7 @@ export interface TestOptions {
   job?: string;
   /** Run in discovery mode to generate .localmostrc */
   updaterc?: boolean;
-  /** Skip the confirmation prompt when --updaterc rewrites a policy */
+  /** Answer yes to every confirmation: grants beyond the workspace, running discovery, and writing what it found */
   assumeYes?: boolean;
   /** Path to a KEY=value file holding secret values */
   secretFile?: string;
@@ -86,8 +97,6 @@ export interface TestOptions {
   showEnv?: boolean;
   /** Secret handling mode */
   secretMode?: 'stub' | 'prompt' | 'abort';
-  /** Save debug info (sandbox logs, collected PIDs) */
-  debug?: boolean;
 }
 
 export interface TestResult {
@@ -112,57 +121,6 @@ export interface JobResult {
 /** Tracks outputs from completed jobs for dependency resolution */
 interface JobOutputs {
   [jobId: string]: Record<string, string>;
-}
-
-// =============================================================================
-// System Log Query for Sandbox Reports
-// =============================================================================
-
-/**
- * Query the macOS unified system log for sandbox reports.
- * Used in discovery mode to find what filesystem paths were accessed.
- *
- * The sandbox (with report) modifier logs to the kernel subsystem:
- *   kernel: (Sandbox) Sandbox: <process>(<pid>) allow <operation> <path>
- */
-function querySandboxLogs(sinceSeconds: number): string {
-  if (process.platform !== 'darwin') {
-    return '';
-  }
-
-  // Query the unified log for sandbox reports.
-  // Use /bin/bash explicitly and write to a temp file to avoid pipe issues.
-  // Note /usr/bin/log, not `log`: zsh has a `log` builtin that shadows it.
-  const stamp = Date.now();
-  const tmpFile = `/tmp/localmost-sandbox-log-${stamp}.txt`;
-  const scriptFile = `/tmp/localmost-query-log-${stamp}.sh`;
-
-  try {
-    const script = `#!/bin/bash
-/usr/bin/log show --last ${sinceSeconds}s 2>/dev/null | grep "kernel: (Sandbox)" > "${tmpFile}" || true
-`;
-    fs.writeFileSync(scriptFile, script);
-    execSync(`/bin/bash "${scriptFile}"`, { encoding: 'utf-8' });
-
-    let output = '';
-    if (fs.existsSync(tmpFile)) {
-      output = fs.readFileSync(tmpFile, 'utf-8');
-    }
-    return output;
-  } catch {
-    // If log command fails, return empty string
-    return '';
-  } finally {
-    // Cleanup belongs here: on the previous success-only path a throw left the
-    // script and its output behind in /tmp for good.
-    for (const file of [tmpFile, scriptFile]) {
-      try {
-        if (fs.existsSync(file)) fs.unlinkSync(file);
-      } catch {
-        // Best effort
-      }
-    }
-  }
 }
 
 // =============================================================================
@@ -235,10 +193,19 @@ function formatStepStatus(status: StepStatus, name: string, duration?: number): 
 // Main Test Function
 // =============================================================================
 
+/** What runTest runs the steps on: a macOS VM from the app, unless a test passes its own. */
+export interface TestDeps {
+  openRunner?: (opts: {
+    proxyPort: number;
+    hostWorkDir: string;
+    onNote: (message: string) => void;
+  }) => Promise<StepRunner & { close(): void; released?(): Promise<void> }>;
+}
+
 /**
  * Run the test command.
  */
-export async function runTest(options: TestOptions = {}): Promise<TestResult> {
+export async function runTest(options: TestOptions = {}, deps: TestDeps = {}): Promise<TestResult> {
   const startTime = Date.now();
   const cwd = process.cwd();
 
@@ -256,7 +223,7 @@ export async function runTest(options: TestOptions = {}): Promise<TestResult> {
   // Load .localmostrc if present
   const localmostrcPath = findLocalmostrc(cwd);
   let config: LocalmostrcConfig | undefined;
-  let policy: SandboxPolicy | undefined;
+  let policy: PolicyRules | undefined;
 
   if (localmostrcPath) {
     console.log(`Using policy: ${path.relative(cwd, localmostrcPath)}`);
@@ -264,15 +231,41 @@ export async function runTest(options: TestOptions = {}): Promise<TestResult> {
     if (result.success && result.config) {
       config = result.config;
       policy = getEffectivePolicy(config, workflow.name);
+      for (const warning of result.warnings) console.log(`${colors.yellow}Warning:${colors.reset} ${warning}`);
     } else {
       console.log(`${colors.yellow}Warning:${colors.reset} Invalid .localmostrc: ${result.errors[0]?.message}`);
     }
-  } else if (!options.updaterc) {
-    console.log(`${colors.yellow}No .localmostrc found.${colors.reset} Run with --updaterc to generate.`);
-    console.log('Running in strict mode (no network access allowed).');
-    // policy stays undefined = empty allowlist
+  } else {
+    const unread = unreadLocalmostrcNote(cwd);
+    if (unread) console.log(`${colors.yellow}Warning:${colors.reset} ${unread}`);
+    if (!options.updaterc) {
+      console.log(`${colors.yellow}No .localmostrc found.${colors.reset} Run with --updaterc to generate.`);
+      console.log('Running in strict mode (no network access allowed).');
+      // policy stays undefined = empty allowlist
+    }
   }
   console.log();
+
+  // The checkout is as untrusted as its code: nothing it grants itself
+  // applies until the user has seen it. Discovery applies no policy, and is
+  // asked about on its own terms. A dry run runs nothing.
+  if (!options.dryRun) {
+    const confirm = { assumeYes: !!options.assumeYes, isTTY: !!process.stdin.isTTY };
+    const confirmed = options.updaterc
+      ? await confirmDiscovery(confirm)
+      : await confirmCheckoutGrants(cwd, grantsBeyondWorkspace(policy), confirm);
+    if (!confirmed) {
+      throw new Error(
+        'Not running: confirm on a terminal, or pass --yes to run this checkout with what it asks for.'
+      );
+    }
+  }
+
+  // What the policy declares that the macOS VM does not give a step yet,
+  // said before anything runs rather than found out from a failing step.
+  if (!options.updaterc) {
+    for (const note of unprovidedGrants(policy)) console.log(`${colors.yellow}Note:${colors.reset} ${note}`);
+  }
 
   // Handle secrets
   const secretNames = extractSecretReferences(workflow.workflow);
@@ -291,9 +284,13 @@ export async function runTest(options: TestOptions = {}): Promise<TestResult> {
     ? undefined  // Discovery mode: allow all traffic through
     : (policy?.network?.allow || []);  // Enforcement mode: use policy or empty
 
-  // Start proxy for network isolation (sandbox restricts traffic to proxy only)
+  // The run's proxy: the guest has no network device, so its relay to this
+  // port is a step's only way out. Enforcement reads the policy as the
+  // runner's proxy does: the deny list first, then the allow list on each
+  // scheme's port. Discovery applies none, and records every host.
   const discoveryProxy = new DiscoveryProxy({
     allowlist: networkAllowlist,
+    denylist: options.updaterc ? undefined : policy?.network?.deny,
     onAccess: (host, port, allowed) => {
       if (options.verbose) {
         const status = allowed ? colors.dim : colors.red;
@@ -304,9 +301,15 @@ export async function runTest(options: TestOptions = {}): Promise<TestResult> {
   });
   const proxyPort = await discoveryProxy.start();
 
+  let runner: (StepRunner & { close(): void; released?(): Promise<void> }) | undefined;
+  const removeInterruptHandlers = installInterruptHandlers(() => {
+    runner?.close();
+    return runner?.released?.();
+  });
+
   // Everything after the proxy starts runs inside try/finally: a throw in
-  // workspace setup, parsing or job execution would otherwise leave the proxy
-  // listening and holding its sockets.
+  // workspace setup, the VM's start, parsing or job execution would
+  // otherwise leave the proxy listening and the VM running.
   try {
   if (options.updaterc) {
     console.log(`Discovery proxy listening on port ${proxyPort}`);
@@ -320,6 +323,10 @@ export async function runTest(options: TestOptions = {}): Promise<TestResult> {
     respectGitignore: !options.noIgnore,
     stagedOnly: options.staged,
   });
+  // RUNNER_TEMP and RUNNER_TOOL_CACHE, there before the first step as a
+  // runner makes them. A plain mkdir: the workspace copy is this run's own.
+  fs.mkdirSync(path.join(workspace.path, RUNNER_TEMP_DIR));
+  fs.mkdirSync(path.join(workspace.path, RUNNER_TOOL_CACHE_DIR));
   console.log(`Workspace: ${workspace.path}`);
   console.log();
 
@@ -328,49 +335,45 @@ export async function runTest(options: TestOptions = {}): Promise<TestResult> {
 
   // Build proxy environment variables
   const proxyUrl = discoveryProxy.getProxyUrl();
+  const proxyEnv = buildProxyEnv(proxyUrl);
 
-  // Create a tmp directory inside workDir for Unix sockets
-  // This keeps sockets within the sandbox's allowed network paths
-  const tmpDir = path.join(workspace.path, '.tmp');
-  fs.mkdirSync(tmpDir, { recursive: true });
-
-  // Create sandbox trace log file
-  // In updaterc mode: captures denies for policy generation
-  // In enforcement mode: captures denies for error reporting
-  const sandboxLogFile = path.join(workspace.path, '.sandbox-trace.log');
-
-  const proxyEnv: Record<string, string> = {
-    HTTP_PROXY: proxyUrl,
-    HTTPS_PROXY: proxyUrl,
-    http_proxy: proxyUrl,
-    https_proxy: proxyUrl,
-    TMPDIR: tmpDir,
-  };
-
-  // Track PIDs for discovery mode (to filter sandbox logs)
-  // Uses kqueue-based pid_tree_watch for real-time process tree tracking
-  const collectedPids = new Set<number>();
+  // A fresh macOS VM for the run, with the workspace sent into it. None for
+  // a dry run, which runs nothing.
+  let active: StepRunner & { close(): void; released?(): Promise<void> };
+  if (options.dryRun) {
+    active = dryRunRunner();
+  } else {
+    console.log('Starting a macOS VM...');
+    const open = deps.openRunner ?? openVmStepRunner;
+    active = await open({
+      proxyPort,
+      hostWorkDir: workspace.path,
+      onNote: (message) => console.log(`  ${colors.dim}${message}${colors.reset}`),
+    });
+    console.log(`macOS VM ready; workspace in it at ${active.workDir}`);
+    console.log();
+  }
+  runner = active;
 
   // Build execution context
   const context: ExecutionContext = {
-    workDir: workspace.path,
-    proxyPort,
-    workflowEnv: {
-      GITHUB_WORKFLOW: workflow.name,
-      GITHUB_REPOSITORY: repository,
-      GITHUB_SHA: gitInfo?.sha || '',
-      GITHUB_REF: gitInfo?.ref || '',
-      ...(workflow.workflow.env || {}),
-      ...proxyEnv,
-    },
+    workDir: active.workDir,
+    hostWorkDir: workspace.path,
+    runner: active,
+    workflowEnv: buildWorkflowEnv(
+      workflow.workflow.env,
+      {
+        GITHUB_WORKFLOW: workflow.name,
+        GITHUB_REPOSITORY: repository,
+        GITHUB_SHA: gitInfo?.sha || '',
+        GITHUB_REF: gitInfo?.ref || '',
+      },
+      proxyEnv
+    ),
     jobEnv: {},
     matrix: {},
     secrets,
     stepOutputs: {},
-    policy,
-    permissive: options.updaterc,
-    sandboxLogFile,
-    collectedPids: options.updaterc ? collectedPids : undefined,
     onOutput: (line, stream) => {
       if (options.verbose) {
         const prefix = stream === 'stderr' ? colors.red : '';
@@ -400,16 +403,13 @@ export async function runTest(options: TestOptions = {}): Promise<TestResult> {
   const jobResults: JobResult[] = [];
   const jobOutputs: JobOutputs = {};
 
-  // Record start time for system log query (discovery mode)
-  const jobsStartTime = Date.now();
-
   for (const jobId of jobsToRun) {
     const job = workflow.workflow.jobs[jobId];
     const jobName = job.name || jobId;
 
     // Check if this is a reusable workflow call
     if (isReusableWorkflowJob(job)) {
-      console.log(`${colors.bold}\u25B6 ${jobName}${colors.reset} ${colors.dim}(reusable workflow)${colors.reset}`);
+      console.log(`${colors.bold}▶ ${jobName}${colors.reset} ${colors.dim}(reusable workflow)${colors.reset}`);
 
       const reusableResult = await runReusableWorkflowJob(
         jobId,
@@ -455,13 +455,13 @@ export async function runTest(options: TestOptions = {}): Promise<TestResult> {
         ? ` (${Object.entries(matrix).map(([k, v]) => `${k}=${v}`).join(', ')})`
         : '';
 
-      console.log(`${colors.bold}\u25B6 ${jobName}${matrixSuffix}${colors.reset}`);
+      console.log(`${colors.bold}▶ ${jobName}${matrixSuffix}${colors.reset}`);
 
       const jobResult = await runJob(
         jobId,
         job,
         matrix,
-        { ...context, matrix, jobEnv: { ...context.jobEnv, GITHUB_JOB: jobId, ...(job.env || {}) } },
+        { ...context, matrix, jobEnv: { ...context.jobEnv, ...withoutReservedEnv(job.env), GITHUB_JOB: jobId } },
         jobOutputs,
         options
       );
@@ -478,7 +478,7 @@ export async function runTest(options: TestOptions = {}): Promise<TestResult> {
   }
 
   // Cleanup old workspaces
-  cleanupWorkspaces({ maxAgeHours: 24, maxCount: 10 });
+  await cleanupWorkspaces({ maxAgeHours: 24, maxCount: 10 });
 
   // Calculate overall result
   const duration = Date.now() - startTime;
@@ -531,9 +531,9 @@ export async function runTest(options: TestOptions = {}): Promise<TestResult> {
   }
 
   if (allSucceeded) {
-    console.log(`\n${colors.green}${colors.bold}\u2713 Workflow passed${colors.reset}`);
+    console.log(`\n${colors.green}${colors.bold}✓ Workflow passed${colors.reset}`);
   } else {
-    console.log(`\n${colors.red}${colors.bold}\u2717 Workflow failed${colors.reset}`);
+    console.log(`\n${colors.red}${colors.bold}✗ Workflow failed${colors.reset}`);
 
   }
 
@@ -541,39 +541,8 @@ export async function runTest(options: TestOptions = {}): Promise<TestResult> {
   if (options.updaterc) {
     const discoveredHosts = discoveryProxy.getAccessedHosts();
 
-    // Query system log for sandbox reports (discovery mode uses 'with report')
-    // Add a few seconds buffer to account for log write delay
-    const elapsedSeconds = Math.ceil((Date.now() - jobsStartTime) / 1000) + 5;
-    const logContent = querySandboxLogs(elapsedSeconds);
-
-    // Save debug info if requested
-    if (options.debug) {
-      const debugDir = path.join(workspace.path, '.debug');
-      if (!fs.existsSync(debugDir)) {
-        fs.mkdirSync(debugDir, { recursive: true });
-      }
-      // Save raw sandbox log
-      fs.writeFileSync(path.join(debugDir, 'sandbox-log.txt'), logContent);
-      // Save collected PIDs
-      fs.writeFileSync(
-        path.join(debugDir, 'collected-pids.json'),
-        JSON.stringify([...collectedPids], null, 2)
-      );
-      console.log(`${colors.dim}Debug info saved to ${debugDir}${colors.reset}`);
-    }
-
-    // Filter log entries to only include PIDs from our process tree
-    // This eliminates noise from other sandboxed processes running concurrently
-    const sandboxTrace = parseSandboxTrace(logContent, workspace.path, collectedPids);
-
     if (allSucceeded) {
-      await handleUpdateRc(
-        cwd,
-        workflow,
-        { hosts: discoveredHosts, readPaths: sandboxTrace.readPaths, writePaths: sandboxTrace.writePaths },
-        sandboxTrace.socketPaths,
-        !!options.assumeYes
-      );
+      await handleUpdateRc(cwd, workflow, { hosts: discoveredHosts }, !!options.assumeYes);
     } else {
       console.log();
       console.log(`${colors.yellow}Skipping .localmostrc generation - workflow failed.${colors.reset}`);
@@ -581,14 +550,6 @@ export async function runTest(options: TestOptions = {}): Promise<TestResult> {
       if (discoveredHosts.length > 0) {
         console.log();
         console.log(`${colors.dim}Hosts discovered so far: ${discoveredHosts.join(', ')}${colors.reset}`);
-      }
-      if (sandboxTrace) {
-        if (sandboxTrace.writePaths.length > 0) {
-          console.log(`${colors.dim}Filesystem writes: ${sandboxTrace.writePaths.join(', ')}${colors.reset}`);
-        }
-        if (sandboxTrace.socketPaths.length > 0) {
-          console.log(`${colors.dim}Socket access: ${sandboxTrace.socketPaths.join(', ')}${colors.reset}`);
-        }
       }
     }
   }
@@ -601,8 +562,125 @@ export async function runTest(options: TestOptions = {}): Promise<TestResult> {
     environmentDiffs,
   };
   } finally {
+    removeInterruptHandlers();
+    runner?.close();
+    // The proxy's port stays the run's until the VM is gone, as the broker's
+    // does: its relay leads there until then.
+    await runner?.released?.();
     await discoveryProxy.stop();
   }
+}
+
+/**
+ * What a policy declares that a step in the macOS VM is not given yet, one
+ * sentence each: filesystem grants, which wait for VM shares, and Docker,
+ * which waits for its relay into the guest.
+ */
+export function unprovidedGrants(policy: PolicyRules | undefined): string[] {
+  const notes: string[] = [];
+  const grants = [
+    ...(policy?.filesystem?.read ?? []).map((p) => `read ${p}`),
+    ...(policy?.filesystem?.write ?? []).map((p) => `write ${p}`),
+  ];
+  if (grants.length > 0) {
+    notes.push(`Filesystem grants are not provided in the macOS VM yet; this run goes without: ${grants.join(', ')}`);
+  }
+  if (policy?.docker && Object.keys(policy.docker).length > 0) {
+    notes.push('Docker is not available in the macOS VM yet; steps that need it will fail');
+  }
+  return notes;
+}
+
+/** The signals that end a run early, and the exit status each ends it with. */
+const INTERRUPT_EXIT_CODES: Partial<Record<NodeJS.Signals, number>> = {
+  SIGINT: 130,
+  SIGTERM: 143,
+  // The terminal closing, or an SSH session dropping.
+  SIGHUP: 129,
+};
+
+/**
+ * How long an interrupted run waits for the app to say its VM is gone
+ * before it exits anyway. A second Ctrl-C exits at once: the handlers are
+ * gone after the first signal.
+ */
+export const INTERRUPT_RELEASE_TIMEOUT_MS = 10_000;
+
+/**
+ * End the run - the agent connection, which kills the steps, and the VM -
+ * then exit, when the run is interrupted. Returns a function that removes
+ * the handlers.
+ *
+ * The steps run in the macOS VM, which the terminal's signals never reach;
+ * without these, dying of one would leave the VM running its steps until
+ * the app noticed the connection gone. `reap` resolves once the VM is gone,
+ * and the exit waits for it, up to `timeoutMs`: exiting first would let the
+ * run's proxy and broker ports go while the VM's relays still lead to them,
+ * for another process to take.
+ */
+export function installInterruptHandlers(
+  reap: () => void | Promise<void>,
+  timeoutMs = INTERRUPT_RELEASE_TIMEOUT_MS
+): () => void {
+  const onInterrupt = (signal: NodeJS.Signals) => {
+    let reaped: Promise<void>;
+    try {
+      reaped = Promise.resolve(reap()).catch(() => undefined);
+    } catch {
+      reaped = Promise.resolve();
+    }
+    let timer: NodeJS.Timeout | undefined;
+    const waited = new Promise<void>((resolve) => {
+      timer = setTimeout(resolve, timeoutMs);
+    });
+    void Promise.race([reaped, waited]).then(() => {
+      clearTimeout(timer);
+      process.exit(INTERRUPT_EXIT_CODES[signal] ?? 1);
+    });
+  };
+  const signals = Object.keys(INTERRUPT_EXIT_CODES) as NodeJS.Signals[];
+  for (const signal of signals) process.once(signal, onInterrupt);
+  return () => {
+    for (const signal of signals) process.removeListener(signal, onInterrupt);
+  };
+}
+
+/**
+ * The variables that send a step's traffic through the run's proxy.
+ *
+ * Loopback is exempt: in the macOS VM it is the guest's own, where a step
+ * reaches a server another step started, and the proxy refuses loopback
+ * outright - through it, a step would reach this Mac's. Git is told to send
+ * the proxy's credentials up front: otherwise it waits for a 407 challenge
+ * the proxy answers by closing the connection, and the fetch aborts.
+ */
+export function buildProxyEnv(proxyUrl: string): Record<string, string> {
+  const noProxy = 'localhost,127.0.0.1,::1';
+  return {
+    HTTP_PROXY: proxyUrl,
+    HTTPS_PROXY: proxyUrl,
+    http_proxy: proxyUrl,
+    https_proxy: proxyUrl,
+    NO_PROXY: noProxy,
+    no_proxy: noProxy,
+    GIT_HTTP_PROXY_AUTHMETHOD: 'basic',
+  };
+}
+
+/**
+ * A run's workflow-level environment: what the workflow declares, then the
+ * GITHUB_* defaults over it, then what the run itself needs.
+ *
+ * GitHub does not let a workflow overwrite its default variables, and here
+ * the workflow is the checkout's to write; spreading its env last let it
+ * claim another repository and ref.
+ */
+export function buildWorkflowEnv(
+  declared: Record<string, string> | undefined,
+  defaults: Record<string, string>,
+  runEnv: Record<string, string>
+): Record<string, string> {
+  return { ...withoutReservedEnv(declared), ...defaults, ...runEnv };
 }
 
 // =============================================================================
@@ -630,36 +708,41 @@ async function runJob(
     needs: jobOutputs,
   };
 
-  for (const step of job.steps!) {
-    if (options.dryRun) {
-      const stepName = step.name || step.id || (step.uses ? `Run ${step.uses}` : 'Run script');
-      console.log(`  ${pending(stepName)} (dry run)`);
-      continue;
-    }
-
-    const result = await executeStep(step, jobContext, job);
-    stepResults.push(result);
-
-    // Print step result
-    if (!options.verbose) {
-      console.log(`  ${formatStepStatus(result.status, result.name, result.duration)}`);
-    }
-
-    // Handle failure
-    if (result.status === 'failure') {
-      jobStatus = 'failure';
-      if (result.error) {
-        console.log(`    ${colors.red}Error: ${result.error}${colors.reset}`);
-      } else if (result.exitCode !== undefined && result.exitCode !== 0) {
-        console.log(`    ${colors.red}Exit code: ${result.exitCode}${colors.reset}`);
-      } else {
-        console.log(`    ${colors.red}Step failed${colors.reset}`);
+  // Whatever the steps left running ends with the job, as on GitHub.
+  try {
+    for (const step of job.steps!) {
+      if (options.dryRun) {
+        const stepName = step.name || step.id || (step.uses ? `Run ${step.uses}` : 'Run script');
+        console.log(`  ${pending(stepName)} (dry run)`);
+        continue;
       }
-      // Stop on first failure (unless continue-on-error)
-      if (!step['continue-on-error']) {
-        break;
+
+      const result = await executeStep(step, jobContext, job);
+      stepResults.push(result);
+
+      // Print step result
+      if (!options.verbose) {
+        console.log(`  ${formatStepStatus(result.status, result.name, result.duration)}`);
+      }
+
+      // Handle failure
+      if (result.status === 'failure') {
+        jobStatus = 'failure';
+        if (result.error) {
+          console.log(`    ${colors.red}Error: ${result.error}${colors.reset}`);
+        } else if (result.exitCode !== undefined && result.exitCode !== 0) {
+          console.log(`    ${colors.red}Exit code: ${result.exitCode}${colors.reset}`);
+        } else {
+          console.log(`    ${colors.red}Step failed${colors.reset}`);
+        }
+        // Stop on first failure (unless continue-on-error)
+        if (!step['continue-on-error']) {
+          break;
+        }
       }
     }
+  } finally {
+    await endJob(context);
   }
 
   // Extract job outputs from step outputs
@@ -747,12 +830,12 @@ async function runReusableWorkflowJob(
       ...context,
       workflowEnv: {
         ...context.workflowEnv,
-        ...(reusableWorkflow.workflow.env || {}),
+        ...withoutReservedEnv(reusableWorkflow.workflow.env),
       },
       jobEnv: {
         ...context.jobEnv,
+        ...withoutReservedEnv(calledJob.env),
         GITHUB_JOB: calledJobId,
-        ...(calledJob.env || {}),
       },
       // Make inputs available as inputs.* context
       inputs,
@@ -760,34 +843,38 @@ async function runReusableWorkflowJob(
       needs: { ...jobOutputs, ...calledJobOutputs },
     };
 
-    // Run steps in the called job
-    for (const step of calledJob.steps!) {
-      if (options.dryRun) {
-        const stepName = step.name || step.id || (step.uses ? `Run ${step.uses}` : 'Run script');
-        console.log(`    ${pending(stepName)} (dry run)`);
-        continue;
-      }
-
-      const result = await executeStep(step, calledContext, calledJob);
-      allStepResults.push(result);
-
-      if (!options.verbose) {
-        console.log(`    ${formatStepStatus(result.status, result.name, result.duration)}`);
-      }
-
-      if (result.status === 'failure') {
-        overallStatus = 'failure';
-        if (result.error) {
-          console.log(`      ${colors.red}Error: ${result.error}${colors.reset}`);
-        } else if (result.exitCode !== undefined && result.exitCode !== 0) {
-          console.log(`      ${colors.red}Exit code: ${result.exitCode}${colors.reset}`);
-        } else {
-          console.log(`      ${colors.red}Step failed${colors.reset}`);
+    // Run steps in the called job, ending what they leave running with it
+    try {
+      for (const step of calledJob.steps!) {
+        if (options.dryRun) {
+          const stepName = step.name || step.id || (step.uses ? `Run ${step.uses}` : 'Run script');
+          console.log(`    ${pending(stepName)} (dry run)`);
+          continue;
         }
-        if (!step['continue-on-error']) {
-          break;
+
+        const result = await executeStep(step, calledContext, calledJob);
+        allStepResults.push(result);
+
+        if (!options.verbose) {
+          console.log(`    ${formatStepStatus(result.status, result.name, result.duration)}`);
+        }
+
+        if (result.status === 'failure') {
+          overallStatus = 'failure';
+          if (result.error) {
+            console.log(`      ${colors.red}Error: ${result.error}${colors.reset}`);
+          } else if (result.exitCode !== undefined && result.exitCode !== 0) {
+            console.log(`      ${colors.red}Exit code: ${result.exitCode}${colors.reset}`);
+          } else {
+            console.log(`      ${colors.red}Step failed${colors.reset}`);
+          }
+          if (!step['continue-on-error']) {
+            break;
+          }
         }
       }
+    } finally {
+      await endJob(calledContext);
     }
 
     // Extract outputs from this job
@@ -812,6 +899,15 @@ async function runReusableWorkflowJob(
     duration: Date.now() - startTime,
     outputs: workflowOutputs,
   };
+}
+
+/** End what a job's steps left running; a failure to is said, and the run goes on. */
+async function endJob(context: ExecutionContext): Promise<void> {
+  try {
+    await context.runner.endJob();
+  } catch (err) {
+    console.log(`  ${colors.yellow}Could not end what the job's steps left running: ${(err as Error).message}${colors.reset}`);
+  }
 }
 
 /**
@@ -920,19 +1016,123 @@ function resolveWorkflowPath(input: string | undefined, cwd: string): string {
 }
 
 
+/** Ask a yes/no question on the terminal; a yes is y or yes, anything else no. */
+async function askOnTerminal(question: string): Promise<string> {
+  const readline = await import('readline');
+  const rl = readline.createInterface({ input: process.stdin, output: process.stdout });
+  return new Promise<string>(resolve => {
+    rl.question(question, a => {
+      rl.close();
+      resolve(a);
+    });
+  });
+}
+
+const isYes = (answer: string): boolean => /^y(es)?$/i.test(answer.trim());
+
 /**
- * List what a discovery run wants to add, and ask before writing it.
+ * What a policy grants a step beyond its workspace: every host. Filesystem
+ * grants are not given in the macOS VM yet (see unprovidedGrants), so they
+ * are not asked about.
+ */
+export function grantsBeyondWorkspace(policy: PolicyRules | undefined): PolicyAddition[] {
+  return nonEmpty([{ label: 'network.allow', items: policy?.network?.allow ?? [] }]);
+}
+
+/** Where the checkouts' confirmed grants are kept: the app data directory, which no step can reach. */
+const checkoutApprovalsPath = (): string => path.join(getAppDataDirWithoutElectron(), 'test-approvals.json');
+
+function readCheckoutApprovals(): Record<string, string> {
+  try {
+    const parsed = JSON.parse(fs.readFileSync(checkoutApprovalsPath(), 'utf-8'));
+    return parsed && typeof parsed === 'object' ? parsed : {};
+  } catch {
+    return {};
+  }
+}
+
+const grantsDigest = (grants: PolicyAddition[]): string =>
+  crypto.createHash('sha256').update(JSON.stringify(grants)).digest('hex');
+
+/**
+ * Ask before running a checkout whose .localmostrc grants it more than its
+ * workspace, and remember a yes for that checkout and exactly those grants.
  *
- * `.localmostrc` is checked in and grants sandbox access, so a discovery run
+ * The policy is the checkout's own to write, like the rest of it, and it is
+ * what confines the checkout: applied without asking, it could let its code
+ * reach any host it likes with whatever the run hands it.
+ * A yes is remembered by where the checkout sits, which it cannot choose,
+ * never by the repository name it claims; any change to the grants is asked
+ * again. Without a terminal, only --yes runs it.
+ */
+export async function confirmCheckoutGrants(
+  sourceDir: string,
+  grants: PolicyAddition[],
+  options: { assumeYes: boolean; isTTY: boolean; ask?: (question: string) => Promise<string> }
+): Promise<boolean> {
+  if (grants.length === 0) return true;
+  const checkoutKey = fs.realpathSync(sourceDir);
+  const digest = grantsDigest(grants);
+  if (readCheckoutApprovals()[checkoutKey] === digest) return true;
+
+  console.log(`${colors.bold}This checkout's .localmostrc grants its workflow more than its workspace:${colors.reset}`);
+  for (const { label, items } of grants) {
+    console.log(`  ${colors.bold}${label}${colors.reset}`);
+    for (const item of items) console.log(`    ${colors.yellow}+${colors.reset} ${item}`);
+  }
+  console.log('The policy comes from the checkout itself. Run it only if you would grant these to its code.');
+  console.log();
+
+  if (options.assumeYes) return true;
+  if (!options.isTTY) return false;
+
+  if (!isYes(await (options.ask ?? askOnTerminal)('Run with these grants? [y/N] '))) return false;
+  const approvals = { ...readCheckoutApprovals(), [checkoutKey]: digest };
+  fs.mkdirSync(path.dirname(checkoutApprovalsPath()), { recursive: true, mode: 0o700 });
+  const partial = `${checkoutApprovalsPath()}.${crypto.randomBytes(8).toString('hex')}`;
+  fs.writeFileSync(partial, JSON.stringify(approvals, null, 2), { mode: 0o600, flag: 'wx' });
+  fs.renameSync(partial, checkoutApprovalsPath());
+  return true;
+}
+
+/**
+ * Ask before a discovery run, every time.
+ *
+ * Discovery has to see which hosts a workflow reaches, so it lets the
+ * checkout reach any host through the proxy. That is only safe on a
+ * checkout you would trust with it, and nothing about a checkout says
+ * whether it is one, so it is not remembered.
+ */
+export async function confirmDiscovery(options: {
+  assumeYes: boolean;
+  isTTY: boolean;
+  ask?: (question: string) => Promise<string>;
+}): Promise<boolean> {
+  console.log(`${colors.yellow}${colors.bold}--updaterc runs this checkout with wide network access:${colors.reset}`);
+  console.log('  Its steps run in a macOS VM, but can reach any host on the internet through the');
+  console.log('  run\'s proxy, with any secret the run hands them. Use it only on a checkout whose');
+  console.log('  code you trust.');
+  console.log();
+  if (options.assumeYes) return true;
+  if (!options.isTTY) return false;
+  return isYes(await (options.ask ?? askOnTerminal)('Run discovery? [y/N] '));
+}
+
+/**
+ * List what a discovery run wants to add, and the file it will write it to,
+ * and ask before writing it.
+ *
+ * `.localmostrc` is checked in and grants network access, so a discovery run
  * must not widen it silently. Without a terminal to ask on, nothing is written
  * unless --yes was passed.
  */
 async function confirmPolicyChange(
+  destination: string,
   additions: { label: string; items: string[] }[],
   assumeYes: boolean
 ): Promise<boolean> {
   console.log();
-  console.log(`${colors.bold}These will be added to .localmostrc:${colors.reset}`);
+  console.log(`${colors.bold}These will be added to ${destination}:${colors.reset}`);
   for (const { label, items } of additions) {
     if (items.length === 0) continue;
     console.log(`  ${colors.bold}${label}${colors.reset}`);
@@ -949,22 +1149,11 @@ async function confirmPolicyChange(
     return false;
   }
 
-  const readline = await import('readline');
-  const rl = readline.createInterface({ input: process.stdin, output: process.stdout });
-  const answer = await new Promise<string>(resolve => {
-    rl.question('Apply these changes? [y/N] ', a => {
-      rl.close();
-      resolve(a);
-    });
-  });
-  const yes = /^y(es)?$/i.test(answer.trim());
+  const yes = isYes(await askOnTerminal('Apply these changes? [y/N] '));
   if (!yes) console.log('Not writing.');
   return yes;
 }
 
-/**
- * Resolve secrets from environment variables or stub them.
- */
 /**
  * Read secrets from a KEY=value file, in the shape people already keep them.
  */
@@ -1017,14 +1206,23 @@ async function promptForSecret(name: string): Promise<string> {
   return value;
 }
 
+/** The environment variable a secret is read from: never the secret's own name. */
+const secretEnvName = (name: string): string => `LOCALMOST_SECRET_${name}`;
+
 /**
  * Resolve the secrets a workflow references.
  *
- * Order is: a --secret-file entry, then the environment, then whatever the
- * chosen mode does about what is left. Nothing is written to disk, and values
- * are masked out of step output by the executor.
+ * Order is: a --secret-file entry, then LOCALMOST_SECRET_<name> in the
+ * environment, then whatever the chosen mode does about what is left.
+ * Nothing is written to disk, and values are masked out of step output by
+ * the executor.
+ *
+ * The workflow chooses which names it asks for, and the checkout is as
+ * untrusted as its code. Read under their own names, a workflow asking for
+ * AWS_SECRET_ACCESS_KEY or GITHUB_TOKEN got whatever the developer had
+ * exported for other tools; the prefix makes passing one a decision.
  */
-async function resolveSecrets(
+export async function resolveSecrets(
   _repository: string,
   names: string[],
   mode: 'stub' | 'prompt' | 'abort',
@@ -1042,23 +1240,29 @@ async function resolveSecrets(
       continue;
     }
 
-    const envValue = process.env[name];
+    const envValue = process.env[secretEnvName(name)];
     if (envValue !== undefined) {
       result[name] = envValue;
-      console.log(`  ${success(name)} (from environment)`);
+      console.log(`  ${success(name)} (from ${secretEnvName(name)})`);
       continue;
+    }
+
+    if (process.env[name] !== undefined) {
+      console.log(
+        `  ${colors.dim}${name} is set in your environment but not used; set ${secretEnvName(name)} to pass it to the workflow.${colors.reset}`
+      );
     }
 
     switch (mode) {
       case 'abort':
         throw new Error(
-          `Missing secret: ${name}. Set it in the environment or pass --secret-file.`
+          `Missing secret: ${name}. Set ${secretEnvName(name)} or pass --secret-file.`
         );
 
       case 'prompt': {
         if (!process.stdin.isTTY) {
           throw new Error(
-            `Missing secret: ${name}. There is no terminal to prompt on - set it in the environment or pass --secret-file.`
+            `Missing secret: ${name}. There is no terminal to prompt on - set ${secretEnvName(name)} or pass --secret-file.`
           );
         }
         result[name] = await promptForSecret(name);
@@ -1085,7 +1289,7 @@ async function resolveSecrets(
     console.log(
       `  Steps using ${stubbed.length === 1 ? 'it' : 'them'} will run anyway and may behave differently than on GitHub.`
     );
-    console.log('  Use --secret-file, set them in the environment, or --secrets abort to stop instead.');
+    console.log('  Use --secret-file, set LOCALMOST_SECRET_<name>, or --secrets abort to stop instead.');
   }
 
   return result;
@@ -1094,18 +1298,22 @@ async function resolveSecrets(
 /**
  * Handle --updaterc flag to generate/update .localmostrc.
  *
- * Uses the access discovered during the workflow run to generate a
- * .localmostrc file with only what your workflow actually needs. Socket
- * paths are reported but never written: no policy key declares one.
+ * Uses the hosts the workflow reached through the run's proxy to generate a
+ * .localmostrc with only what your workflow actually needs. Filesystem
+ * access is not recorded: nothing traces it in the macOS VM yet.
  */
-async function handleUpdateRc(
+export async function handleUpdateRc(
   cwd: string,
   workflow: ParsedWorkflow,
-  discovered: DiscoveredAccess,
-  socketPaths: string[],
+  found: DiscoveredAccess,
   assumeYes: boolean
 ): Promise<void> {
-  const { hosts: discoveredHosts, readPaths, writePaths } = discovered;
+  // A host the URL parser accepts can still be one no network entry can
+  // name - an empty label, one over 63 characters. Written in, it would
+  // leave a .localmostrc that no longer parses, so it is reported instead.
+  const unwritableHosts = found.hosts.filter((host) => hostPatternProblem(host) !== null);
+  const discovered: DiscoveredAccess = { ...found, hosts: found.hosts.filter((host) => !unwritableHosts.includes(host)) };
+  const discoveredHosts = discovered.hosts;
   const dockerHints = discovered.dockerHints ?? [];
 
   console.log();
@@ -1123,30 +1331,16 @@ async function handleUpdateRc(
       console.log(`    ${colors.dim}... and ${discoveredHosts.length - 5} more${colors.reset}`);
     }
   }
-
-  // Report filesystem access
-  if (readPaths.length === 0 && writePaths.length === 0) {
-    console.log(`  Filesystem: ${colors.dim}No access outside workDir${colors.reset}`);
-  } else {
-    if (readPaths.length > 0) {
-      console.log(`  Filesystem reads: ${readPaths.length} path(s) need read access`);
-      for (const p of readPaths.slice(0, 3)) {
-        console.log(`    ${colors.dim}- ${p}${colors.reset}`);
-      }
-      if (readPaths.length > 3) {
-        console.log(`    ${colors.dim}... and ${readPaths.length - 3} more${colors.reset}`);
-      }
-    }
-    if (writePaths.length > 0) {
-      console.log(`  Filesystem writes: ${writePaths.length} path(s) need write access`);
-      for (const p of writePaths.slice(0, 3)) {
-        console.log(`    ${colors.dim}- ${p}${colors.reset}`);
-      }
-      if (writePaths.length > 3) {
-        console.log(`    ${colors.dim}... and ${writePaths.length - 3} more${colors.reset}`);
-      }
+  if (unwritableHosts.length > 0) {
+    console.log(`  Network: ${unwritableHosts.length} host(s) reached but not written, as no entry can name them`);
+    for (const host of unwritableHosts) {
+      console.log(`    ${colors.yellow}- ${host}${colors.reset} ${colors.dim}${hostPatternProblem(host)}${colors.reset}`);
     }
   }
+
+  // The kernel's sandbox trace that recorded paths is gone with the
+  // sandbox; recording the paths a step misses in the guest is to come.
+  console.log(`  Filesystem: ${colors.dim}not recorded - discovery in the macOS VM does not trace filesystem access yet${colors.reset}`);
 
   // Report what the filtering docker socket refused. Each denial's hint is
   // the policy that would have permitted it, and those are what get written.
@@ -1154,40 +1348,14 @@ async function handleUpdateRc(
     console.log(`  Docker: ${dockerHints.length} request(s) refused by the filtering socket`);
   }
 
-  // Report socket access. There is no policy key for unix sockets: the only
-  // socket a job is handed is the one localmost serves, and what it may do
-  // through that is declared by action under `docker:`, not by path.
-  if (socketPaths.length > 0) {
-    console.log(`  Sockets: ${socketPaths.length} socket(s) were reached`);
-    for (const p of socketPaths) {
-      console.log(`    ${colors.dim}- ${p}${colors.reset}`);
-    }
-    if (socketPaths.some(p => p.includes('docker.sock'))) {
-      console.log(
-        `    ${colors.yellow}Docker is declared by action under \`docker:\` (pull, run, build), not as a socket${colors.reset}`
-      );
-    }
-  }
-
   console.log();
 
   // Check if there's anything to add
-  if (discoveredHosts.length === 0 && readPaths.length === 0 && writePaths.length === 0 && dockerHints.length === 0) {
-    if (socketPaths.length > 0) {
-      // Sockets were reached, but no policy key declares one, so there is
-      // genuinely nothing to write - saying "no access" would contradict the
-      // socket list printed just above.
-      console.log(`${colors.yellow}Nothing to write to .localmostrc.${colors.reset}`);
-      console.log('The only access recorded was to unix sockets, which no policy key declares.');
-      console.log('Docker is declared by action under `docker:` (pull, run, build) - see docs/roadmap/localmostrc.md.');
-      return;
-    }
-
+  if (discoveredHosts.length === 0 && dockerHints.length === 0) {
     console.log(`${colors.yellow}No access to configure.${colors.reset}`);
     console.log('This may happen if:');
     console.log('  - Your workflow doesn\'t make network requests');
     console.log('  - The tools used don\'t respect HTTP_PROXY environment variable');
-    console.log('  - All filesystem access was within the working directory');
     return;
   }
 
@@ -1212,27 +1380,22 @@ async function handleUpdateRc(
     return;
   }
 
-  const approved = await confirmPolicyChange(additions, assumeYes);
+  // Named as the file it is, with any link in the path to the checkout
+  // resolved: findLocalmostrc has refused anything at the name itself but a
+  // regular file, and writeLocalmostrc will not follow one put there later.
+  const destination = path.join(cwd, LOCALMOSTRC_FILENAME);
+  const resolved = path.join(fs.realpathSync(path.dirname(destination)), path.basename(destination));
+  const approved = await confirmPolicyChange(resolved, additions, assumeYes);
   if (!approved) return;
 
-  const content = serializeLocalmostrc(config);
-  if (existingPath) {
-    fs.writeFileSync(existingPath, content);
-    console.log(`${colors.green}✓${colors.reset} Updated ${path.relative(cwd, existingPath)}`);
-  } else {
-    fs.writeFileSync(path.join(cwd, '.localmostrc'), content);
-    console.log(`${colors.green}✓${colors.reset} Created .localmostrc`);
-  }
+  writeLocalmostrc(destination, serializeLocalmostrc(config));
+  console.log(`${colors.green}✓${colors.reset} ${existingPath ? 'Updated' : 'Created'} ${path.relative(cwd, destination)}`);
 }
 
 /** What a discovery run found that a policy could grant. */
 export interface DiscoveredAccess {
   /** Hosts reached through the discovery proxy. */
   hosts: string[];
-  /** Paths outside the workspace that were read. */
-  readPaths: string[];
-  /** Paths outside the workspace that were written. */
-  writePaths: string[];
   /**
    * What the filtering docker socket refused, as the hints its denials log:
    * each the YAML under `docker:` that would have permitted the request.
@@ -1291,7 +1454,7 @@ export function mergeDiscoveredAccess(
   discovered: DiscoveredAccess,
   workflowName: string
 ): { config: LocalmostrcConfig; additions: PolicyAddition[] } {
-  const { hosts, readPaths, writePaths } = discovered;
+  const { hosts } = discovered;
   const suggestedDocker = dockerPolicyFromHints(discovered.dockerHints ?? []);
 
   if (!existing) {
@@ -1301,10 +1464,6 @@ export function mergeDiscoveredAccess(
         network: hosts.length > 0 ? {
           allow: hosts,
         } : undefined,
-        filesystem: (readPaths.length > 0 || writePaths.length > 0) ? {
-          read: readPaths.length > 0 ? readPaths : undefined,
-          write: writePaths.length > 0 ? writePaths : undefined,
-        } : undefined,
         ...(suggestedDocker ? { docker: suggestedDocker } : {}),
       },
       workflows: {
@@ -1313,22 +1472,20 @@ export function mergeDiscoveredAccess(
     };
     const additions = nonEmpty([
       { label: 'network.allow', items: hosts },
-      { label: 'filesystem.read', items: readPaths },
-      { label: 'filesystem.write', items: writePaths },
       ...dockerAdditions(undefined, suggestedDocker),
     ]);
+    // The workflow's entry is written too, so it is listed with the rest.
+    // Its name is whatever the workflow file says, so it is shown quoted, as
+    // it is written, where a newline or a terminal escape in it shows as one.
+    if (additions.length > 0) {
+      additions.push({ label: 'workflows', items: [JSON.stringify(workflowName)] });
+    }
     return { config, additions };
   }
 
   // Calculate new items to add
   const existingHosts = new Set(existing.shared?.network?.allow || []);
   const newHosts = hosts.filter(h => !existingHosts.has(h));
-
-  const existingReadPaths = new Set(existing.shared?.filesystem?.read || []);
-  const newReadPaths = readPaths.filter(p => !existingReadPaths.has(p));
-
-  const existingWritePaths = new Set(existing.shared?.filesystem?.write || []);
-  const newWritePaths = writePaths.filter(p => !existingWritePaths.has(p));
 
   // Docker composes additively, so a hint only ever adds to what is declared.
   const existingDocker = existing.shared?.docker;
@@ -1343,18 +1500,11 @@ export function mergeDiscoveredAccess(
         ...existing.shared?.network,
         allow: [...(existing.shared?.network?.allow || []), ...newHosts],
       },
-      filesystem: (newReadPaths.length > 0 || newWritePaths.length > 0 || existing.shared?.filesystem) ? {
-        ...existing.shared?.filesystem,
-        read: newReadPaths.length > 0 ? [...(existing.shared?.filesystem?.read || []), ...newReadPaths] : existing.shared?.filesystem?.read,
-        write: newWritePaths.length > 0 ? [...(existing.shared?.filesystem?.write || []), ...newWritePaths] : existing.shared?.filesystem?.write,
-      } : undefined,
       ...(docker ? { docker } : {}),
     },
   };
   const additions = nonEmpty([
     { label: 'network.allow', items: newHosts },
-    { label: 'filesystem.read', items: newReadPaths },
-    { label: 'filesystem.write', items: newWritePaths },
     ...dockerAdditions(existingDocker, docker),
   ]);
   return { config, additions };
@@ -1405,8 +1555,15 @@ export function parseTestArgs(args: string[]): TestOptions {
       }
       options.secretMode = mode;
     } else if (arg === '--debug') {
-      options.debug = true;
-    } else if (!arg.startsWith('-')) {
+      throw new Error(
+        '--debug was removed: it saved the sandbox trace of the old filesystem discovery, ' +
+          'which a run in the macOS VM does not make. Use --verbose for the steps\' output.'
+      );
+    } else if (arg.startsWith('-')) {
+      // Ignored, a misspelt or removed flag ran the workflow without the
+      // option the user asked for.
+      throw new Error(`Unknown option for localmost test: ${arg}. See localmost test --help.`);
+    } else {
       options.workflow = arg;
     }
 
@@ -1434,8 +1591,10 @@ ${colors.bold}OPTIONS:${colors.reset}
   -j, --job <name>  Run specific job only
   -m, --matrix <spec>  Run specific matrix combination (e.g., "os=macos,node=18")
   -f, --full-matrix Run all matrix combinations
-  -u, --updaterc    Discovery mode: record access and generate .localmostrc
-  -y, --yes         Apply --updaterc changes without confirming
+  -u, --updaterc    Discovery mode: record the hosts reached and generate
+                    .localmostrc (filesystem access is not recorded yet)
+  -y, --yes         Answer yes to every confirmation: a .localmostrc's grants
+                    beyond the workspace, running --updaterc, and its changes
   -n, --dry-run     Show what would run without executing
   -v, --verbose     Show command output
   --staged          Use staged changes only (git diff --staged)
@@ -1452,11 +1611,15 @@ ${colors.bold}EXAMPLES:${colors.reset}
   localmost test -v --env           Verbose output with environment diff
 
 ${colors.bold}ENVIRONMENT:${colors.reset}
-  Uses your local machine as the runner. Secrets come from the environment or
-  a --secret-file; they are never written to disk and are masked out of output.
+  Each run's steps run in a fresh macOS VM from localmost's golden image, as
+  runner jobs do, so the localmost app must be running with the image built
+  (Settings > macOS VM). Secrets come from a --secret-file or
+  LOCALMOST_SECRET_<name> in the environment, never a variable under the
+  secret's own name; they are never written to disk and are masked out of output.
 
-${colors.bold}SANDBOX:${colors.reset}
-  Workflows run in a sandbox. Configure access in .localmostrc:
+${colors.bold}NETWORK:${colors.reset}
+  The VM reaches the network only through the run's proxy. Allow hosts in
+  .localmostrc:
     version: 1
     shared:
       network:

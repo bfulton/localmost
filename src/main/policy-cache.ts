@@ -3,9 +3,11 @@
  *
  * Caches .localmostrc policies per repository for the background runner.
  * Detects changes and requires approval before running jobs with updated policies.
+ * The cache itself - its format, and how approval is bound to what was shown -
+ * is shared with the CLI in shared/policy-store.
  */
 
-import * as fs from 'fs';
+import * as crypto from 'crypto';
 import * as path from 'path';
 import {
   LocalmostrcConfig,
@@ -13,9 +15,26 @@ import {
   diffConfigs,
   PolicyDiff,
   formatPolicyDiff,
+  getEffectivePolicy,
 } from '../shared/localmostrc';
+import { hasDockerGrants } from '../shared/docker-policy';
+import {
+  PolicyEntry,
+  approvalStamp,
+  approvePending,
+  bindRepositoryId,
+  isRepositoryId,
+  listPolicyEntries,
+  readPolicyEntry,
+  recordPending,
+  rejectPending,
+  recordPolicyDecision as appendPolicyDecision,
+} from '../shared/policy-store';
 import { getAppDataDir } from './paths';
 import { getLogger } from './app-state';
+
+export { approvalStamp };
+export type { PolicyEntry };
 
 const log = {
   debug: (message: string) => getLogger()?.debug(message),
@@ -27,28 +46,18 @@ const log = {
 // Types
 // =============================================================================
 
-export interface CachedPolicy {
-  /** Repository identifier (owner/repo) */
-  repository: string;
-  /** The cached policy config */
-  config: LocalmostrcConfig;
-  /** When the policy was cached */
-  cachedAt: string;
-  /** SHA of the commit when policy was approved */
-  approvedAtCommit?: string;
-  /** Whether the policy has been explicitly approved */
-  approved: boolean;
-}
-
 export interface PolicyApprovalRequest {
   repository: string;
   oldConfig?: LocalmostrcConfig;
   newConfig: LocalmostrcConfig;
   diffs: PolicyDiff[];
   isNewRepo: boolean;
+  /**
+   * The repository id the approved policy was bound to, when the job came
+   * from a different repository under the same name.
+   */
+  replacesRepositoryId?: number;
 }
-
-export type PolicyApprovalCallback = (request: PolicyApprovalRequest) => Promise<boolean>;
 
 // =============================================================================
 // Cache Management
@@ -64,114 +73,53 @@ function getPolicyCacheDir(): string {
 }
 
 /**
- * Ensure the cache directory exists.
+ * Load a repository's cache entry. An entry that cannot be trusted reads as
+ * none: its approved policy is not applied, and the next job asks again.
  */
-function ensureCacheDir(): void {
-  const dir = getPolicyCacheDir();
-  if (!fs.existsSync(dir)) {
-    fs.mkdirSync(dir, { recursive: true });
-  }
-}
-
-/**
- * Get the path for a cached policy file.
- */
-function getPolicyFilePath(repository: string): string {
-  const safeRepo = repository.replace('/', '_');
-  return path.join(getPolicyCacheDir(), `${safeRepo}.json`);
-}
-
-/**
- * Load a cached policy for a repository.
- */
-export function getCachedPolicy(repository: string): CachedPolicy | null {
-  const filePath = getPolicyFilePath(repository);
-  if (!fs.existsSync(filePath)) {
-    return null;
-  }
-
+export function getPolicyEntry(repository: string): PolicyEntry | null {
   try {
-    const content = fs.readFileSync(filePath, 'utf-8');
-    return JSON.parse(content) as CachedPolicy;
+    return readPolicyEntry(getPolicyCacheDir(), repository);
   } catch (err) {
-    log.warn(`Failed to load cached policy for ${repository}: ${(err as Error).message}`);
+    log.warn(`Ignoring cached policy for ${repository}: ${(err as Error).message}`);
     return null;
   }
 }
 
 /**
- * Save a policy to the cache.
+ * The policy approved for a repository, whatever commit a job is at. Not
+ * exported: a job is given getApprovedPolicyForCommit, which also asks
+ * whether the job's own commit carries this policy.
  */
-export function cachePolicyConfig(
-  repository: string,
-  config: LocalmostrcConfig,
-  approved: boolean = false,
-  commit?: string
-): void {
-  ensureCacheDir();
-
-  const cached: CachedPolicy = {
-    repository,
-    config,
-    cachedAt: new Date().toISOString(),
-    approvedAtCommit: commit,
-    approved,
-  };
-
-  const filePath = getPolicyFilePath(repository);
-  fs.writeFileSync(filePath, JSON.stringify(cached, null, 2));
-  log.debug(`Cached policy for ${repository}`);
+function getApprovedPolicy(repository: string): LocalmostrcConfig | null {
+  return getPolicyEntry(repository)?.approved?.config ?? null;
 }
 
 /**
- * Mark a cached policy as approved.
+ * Approve the pending policy for a repository, provided the stamp the reviewer
+ * quotes is the one it was shown with. Throws otherwise.
  */
-export function approvePolicy(repository: string, commit?: string): void {
-  const cached = getCachedPolicy(repository);
-  if (cached) {
-    cached.approved = true;
-    cached.approvedAtCommit = commit;
-    const filePath = getPolicyFilePath(repository);
-    fs.writeFileSync(filePath, JSON.stringify(cached, null, 2));
-    log.info(`Approved policy for ${repository}`);
-  }
+export function approvePolicy(repository: string, stamp: string): void {
+  approvePending(getPolicyCacheDir(), repository, stamp);
+  recordPolicyDecision(repository, 'approved', stamp);
+  log.info(`Approved policy for ${repository} (${stamp.slice(0, 12)})`);
 }
 
 /**
- * Remove a cached policy.
+ * Drop the pending policy for a repository. The approved one stays in force.
  */
-export function removeCachedPolicy(repository: string): boolean {
-  const filePath = getPolicyFilePath(repository);
-  if (fs.existsSync(filePath)) {
-    fs.unlinkSync(filePath);
-    log.debug(`Removed cached policy for ${repository}`);
-    return true;
-  }
-  return false;
+export function rejectPolicy(repository: string): void {
+  const stamp = rejectPending(getPolicyCacheDir(), repository);
+  // A decision about nothing would be noise in the audit log.
+  if (!stamp) throw new Error(`There is nothing waiting for approval for ${repository}`);
+  recordPolicyDecision(repository, 'rejected', stamp);
+  log.info(`Rejected pending policy for ${repository}`);
 }
 
 /**
  * List all cached policies.
  */
-export function listCachedPolicies(): CachedPolicy[] {
-  const dir = getPolicyCacheDir();
-  if (!fs.existsSync(dir)) {
-    return [];
-  }
-
-  const files = fs.readdirSync(dir).filter((f) => f.endsWith('.json'));
-  const policies: CachedPolicy[] = [];
-
-  for (const file of files) {
-    try {
-      const content = fs.readFileSync(path.join(dir, file), 'utf-8');
-      policies.push(JSON.parse(content));
-    } catch {
-      // Skip invalid files
-    }
-  }
-
-  return policies;
+export function listCachedPolicies(): PolicyEntry[] {
+  return listPolicyEntries(getPolicyCacheDir());
 }
 
 // =============================================================================
@@ -179,109 +127,16 @@ export function listCachedPolicies(): CachedPolicy[] {
 // =============================================================================
 
 /**
- * Validate a policy for a job.
- * Returns null if approved, or a PolicyApprovalRequest if approval is needed.
+ * Append an approval decision to the audit log, with the stamp of the policy
+ * decided on, so the record says which policy it was and not just when.
  */
-export function validatePolicyForJob(
+export function recordPolicyDecision(
   repository: string,
-  localmostrcContent: string | null
-): PolicyApprovalRequest | null {
-  const cached = getCachedPolicy(repository);
-
-  // No .localmostrc in repo
-  if (!localmostrcContent) {
-    if (!cached) {
-      // New repo without policy - needs approval to run with default policy
-      return {
-        repository,
-        oldConfig: undefined,
-        newConfig: { version: 1, shared: {} },
-        diffs: [],
-        isNewRepo: true,
-      };
-    }
-    // Had a policy before, now removed - needs approval
-    return {
-      repository,
-      oldConfig: cached.config,
-      newConfig: { version: 1, shared: {} },
-      diffs: diffConfigs(cached.config, { version: 1, shared: {} }),
-      isNewRepo: false,
-    };
-  }
-
-  // Parse the new policy
-  const parseResult = parseLocalmostrcContent(localmostrcContent);
-  if (!parseResult.success || !parseResult.config) {
-    log.warn(`Invalid .localmostrc for ${repository}: ${parseResult.errors[0]?.message}`);
-    // Invalid policy - treat as no policy
-    return {
-      repository,
-      oldConfig: cached?.config,
-      newConfig: { version: 1, shared: {} },
-      diffs: [],
-      isNewRepo: !cached,
-    };
-  }
-
-  const newConfig = parseResult.config;
-
-  // No cached policy - new repo
-  if (!cached) {
-    return {
-      repository,
-      oldConfig: undefined,
-      newConfig,
-      diffs: [],
-      isNewRepo: true,
-    };
-  }
-
-  // Compare with cached
-  const diffs = diffConfigs(cached.config, newConfig);
-
-  // No changes and previously approved
-  if (diffs.length === 0 && cached.approved) {
-    return null;
-  }
-
-  // Changes detected
-  if (diffs.length > 0) {
-    return {
-      repository,
-      oldConfig: cached.config,
-      newConfig,
-      diffs,
-      isNewRepo: false,
-    };
-  }
-
-  // No changes but not yet approved
-  if (!cached.approved) {
-    return {
-      repository,
-      oldConfig: cached.config,
-      newConfig,
-      diffs: [],
-      isNewRepo: false,
-    };
-  }
-
-  return null;
-}
-
-/**
- * Append an approval decision to an audit log.
- *
- * Approving a policy widens what someone else's code may do on this machine,
- * so the decision is worth a durable record separate from the cache entry,
- * which only ever holds the current state.
- */
-export function recordPolicyDecision(repository: string, decision: 'approved' | 'rejected'): void {
+  decision: 'approved' | 'rejected',
+  stamp?: string
+): void {
   try {
-    ensureCacheDir();
-    const line = JSON.stringify({ at: new Date().toISOString(), repository, decision });
-    fs.appendFileSync(path.join(getPolicyCacheDir(), 'decisions.log'), `${line}\n`);
+    appendPolicyDecision(getPolicyCacheDir(), { repository, decision, stamp, via: 'app' });
   } catch (err) {
     log.warn(`Could not record policy decision for ${repository}: ${(err as Error).message}`);
   }
@@ -296,25 +151,142 @@ export type PolicyDecision =
   | { action: 'invalid'; reason: string };
 
 /**
+ * The checked commits the approved policy covers, keyed by repository and
+ * commit, each with the stamp of the approved policy its .localmostrc matched.
+ *
+ * The approval cache is per repository, but a job runs one commit, and a
+ * commit whose file was deleted must not inherit the grants of one that had
+ * it. So the approved policy goes only to a commit the pre-spawn check found
+ * carrying it. A commit it never saw, or saw under another name (the check
+ * keys on the name GitHub reports, the policy lookup on the target's), gets
+ * nothing, and neither does one whose approved policy has been replaced
+ * since: that is no longer the commit's own file. Every legitimate job is
+ * checked in this process, at the same commit, before its worker is spawned,
+ * so none loses its grants to this; an entry that is evicted or lost on
+ * restart fails to the baseline.
+ */
+const commitCoverage = new Map<string, string>();
+const COMMIT_COVERAGE_LIMIT = 1000;
+
+function commitKey(repository: string, sha: string): string {
+  return `${repository.toLowerCase()}@${sha}`;
+}
+
+function recordCommitCoverage(repository: string, sha: string, coveredBy: LocalmostrcConfig | null): void {
+  const key = commitKey(repository, sha);
+  commitCoverage.delete(key);
+  if (!coveredBy) return;
+  commitCoverage.set(key, approvalStamp(repository, coveredBy));
+  if (commitCoverage.size > COMMIT_COVERAGE_LIMIT) {
+    commitCoverage.delete(commitCoverage.keys().next().value as string);
+  }
+}
+
+/**
+ * The approved policy to apply to a job at a given commit: only one the
+ * pre-spawn check found that commit's .localmostrc matching, and only while it
+ * is still the approved policy. Anything else runs on the baseline.
+ */
+export function getApprovedPolicyForCommit(repository: string, sha: string): LocalmostrcConfig | null {
+  const coveredBy = commitCoverage.get(commitKey(repository, sha));
+  if (!coveredBy) return null;
+  const approved = getApprovedPolicy(repository);
+  return approved && approvalStamp(repository, approved) === coveredBy ? approved : null;
+}
+
+/**
+ * Whether the approved policy for a job's commit grants Docker to the job's
+ * workflow - shared and its own section merged, as the claim binds it - as
+ * admission asks before spawning. A job with no commit, or at one the check
+ * did not find carrying the approved policy, gets the baseline: no Docker.
+ */
+export function approvedDockerForCommit(
+  repository: string,
+  sha: string | undefined,
+  workflow: string | undefined
+): boolean {
+  const approved = sha ? getApprovedPolicyForCommit(repository, sha) : null;
+  return approved !== null && hasDockerGrants(getEffectivePolicy(approved, workflow ?? '').docker);
+}
+
+/**
  * Decide whether a job may run under the repository's current policy.
  *
  * A .localmostrc grants access beyond the built-in baseline, so its arrival or
  * change is a request for more privilege and needs the machine owner's consent.
  * A repository with no policy is not asked about: it gets the baseline, which
- * grants nothing extra. Removing a policy is likewise allowed without asking -
- * it can only reduce access.
+ * grants nothing extra. Removing a policy is likewise allowed without asking,
+ * because the job then runs on the baseline: only a commit decided here as
+ * carrying the approved policy is given it by getApprovedPolicyForCommit.
+ * The commit is required so that a caller cannot decide without recording.
+ *
+ * The repository id, when the job carries one, is held to the one the
+ * approval was bound to: a name can be freed by deleting or renaming a
+ * repository and taken by another, whose .localmostrc need only match the
+ * approved one to inherit its grants. An approval bound to no id yet is
+ * bound to the first job that matches it.
  */
 export function decidePolicyForJob(
   repository: string,
-  localmostrcContent: string | null
+  localmostrcContent: string | null,
+  sha: string,
+  jobRepositoryId?: number
 ): PolicyDecision {
-  const cached = getCachedPolicy(repository);
+  const repositoryId = validRepositoryId(repository, jobRepositoryId);
+  const decision = decide(repository, localmostrcContent, repositoryId);
+  const covered = decision.action === 'allow' && decision.reason === 'unchanged';
+  if (covered && repositoryId !== undefined) {
+    try {
+      bindRepositoryId(getPolicyCacheDir(), repository, repositoryId);
+    } catch (err) {
+      log.warn(`Could not bind the approved policy for ${repository} to its repository id: ${(err as Error).message}`);
+    }
+  }
+  recordCommitCoverage(repository, sha, covered ? getApprovedPolicy(repository) : null);
+  return decision;
+}
+
+/**
+ * The job's repository id, or undefined when it carries none or one that is
+ * not an id. A malformed one is treated as none, as before ids were kept,
+ * rather than compared or stored: stored, it made the entry unreadable, and
+ * the next change replaced the entry, approval and all.
+ */
+function validRepositoryId(repository: string, repositoryId: number | undefined): number | undefined {
+  if (repositoryId === undefined || isRepositoryId(repositoryId)) return repositoryId;
+  log.warn(`Ignoring a malformed repository id for ${repository}: ${String(repositoryId)}`);
+  return undefined;
+}
+
+/**
+ * The parse warnings already logged, by repository and the content's hash:
+ * every job reads the policy again, and the same ignored `isolation:` or
+ * `network.loopback` said at each would fill the log. Bounded; once full it
+ * starts over, and a warning may be said once more.
+ */
+const loggedWarnings = new Set<string>();
+const MAX_LOGGED_WARNINGS = 1000;
+
+/** Logs a policy's parse warnings (keys it ignores, a missing version) once per repository and content. */
+function logParseWarnings(repository: string, content: string, warnings: string[]): void {
+  if (warnings.length === 0) return;
+  const key = `${repository}\0${crypto.createHash('sha256').update(content).digest('hex')}`;
+  if (loggedWarnings.has(key)) return;
+  if (loggedWarnings.size >= MAX_LOGGED_WARNINGS) loggedWarnings.clear();
+  loggedWarnings.add(key);
+  for (const warning of warnings) log.warn(`.localmostrc for ${repository}: ${warning}`);
+}
+
+function decide(repository: string, localmostrcContent: string | null, repositoryId?: number): PolicyDecision {
+  const approvedVersion = getPolicyEntry(repository)?.approved;
+  const approved = approvedVersion?.config ?? null;
 
   if (!localmostrcContent) {
-    return { action: 'allow', reason: cached ? 'narrowed' : 'no-policy' };
+    return { action: 'allow', reason: approved ? 'narrowed' : 'no-policy' };
   }
 
   const parseResult = parseLocalmostrcContent(localmostrcContent);
+  logParseWarnings(repository, localmostrcContent, parseResult.warnings);
   if (!parseResult.success || !parseResult.config) {
     // The repository has a policy; we just cannot read it. Running anyway would
     // mean deciding on a file nobody has reviewed, so hold the job instead.
@@ -325,36 +297,40 @@ export function decidePolicyForJob(
 
   const newConfig = parseResult.config;
 
-  if (cached?.approved) {
-    const diffs = diffConfigs(cached.config, newConfig);
+  if (approved) {
+    const diffs = diffConfigs(approved, newConfig);
+    const boundTo = approvedVersion?.repositoryId;
+    if (repositoryId !== undefined && boundTo !== undefined && repositoryId !== boundTo) {
+      // Another repository under the approved one's name: what was approved
+      // was never asked for by this one.
+      return {
+        action: 'needs-approval',
+        request: { repository, oldConfig: approved, newConfig, diffs, isNewRepo: true, replacesRepositoryId: boundTo },
+      };
+    }
     if (diffs.length === 0) {
       return { action: 'allow', reason: 'unchanged' };
     }
     return {
       action: 'needs-approval',
-      request: { repository, oldConfig: cached.config, newConfig, diffs, isNewRepo: false },
+      request: { repository, oldConfig: approved, newConfig, diffs, isNewRepo: false },
     };
   }
 
   return {
     action: 'needs-approval',
-    request: {
-      repository,
-      oldConfig: cached?.config,
-      newConfig,
-      diffs: cached ? diffConfigs(cached.config, newConfig) : [],
-      isNewRepo: !cached,
-    },
+    request: { repository, oldConfig: undefined, newConfig, diffs: [], isNewRepo: true },
   };
 }
 
 /**
- * Record a policy as awaiting approval, so the CLI can show what is pending.
+ * Record a policy as awaiting approval, so the app and the CLI can show what
+ * is pending. An approved policy is left in force alongside it.
  */
-export function recordPendingPolicy(repository: string, config: LocalmostrcConfig): void {
-  cachePolicyConfig(repository, config, false);
+export function recordPendingPolicy(repository: string, config: LocalmostrcConfig, repositoryId?: number): void {
+  recordPending(getPolicyCacheDir(), repository, config, validRepositoryId(repository, repositoryId));
+  log.debug(`Recorded pending policy for ${repository}`);
 }
-
 
 /**
  * Format a policy approval request for notification.
@@ -362,7 +338,12 @@ export function recordPendingPolicy(repository: string, config: LocalmostrcConfi
 export function formatApprovalRequest(request: PolicyApprovalRequest): string {
   const lines: string[] = [];
 
-  if (request.isNewRepo) {
+  if (request.replacesRepositoryId !== undefined) {
+    lines.push(`New repository under an approved name: ${request.repository}`);
+    lines.push('');
+    lines.push(`Its policy was approved for repository id ${request.replacesRepositoryId}, and this job`);
+    lines.push('comes from a different repository with that name. Review the sandbox policy before approving.');
+  } else if (request.isNewRepo) {
     lines.push(`New repository: ${request.repository}`);
     lines.push('');
     lines.push('This repository wants to run workflows on your machine.');
@@ -378,58 +359,4 @@ export function formatApprovalRequest(request: PolicyApprovalRequest): string {
   }
 
   return lines.join('\n');
-}
-
-// =============================================================================
-// Event Emitter for Policy Changes
-// =============================================================================
-
-let approvalCallback: PolicyApprovalCallback | null = null;
-
-/**
- * Register a callback for policy approval requests.
- */
-export function onPolicyApprovalNeeded(callback: PolicyApprovalCallback): void {
-  approvalCallback = callback;
-}
-
-/**
- * Request policy approval (calls registered callback).
- */
-export async function requestPolicyApproval(request: PolicyApprovalRequest): Promise<boolean> {
-  if (!approvalCallback) {
-    log.warn('No policy approval callback registered');
-    return false;
-  }
-
-  return approvalCallback(request);
-}
-
-/**
- * Check if a job can run based on policy.
- * If approval is needed, requests it and waits for response.
- */
-export async function canRunJob(
-  repository: string,
-  localmostrcContent: string | null
-): Promise<boolean> {
-  const approvalRequest = validatePolicyForJob(repository, localmostrcContent);
-
-  if (!approvalRequest) {
-    // No approval needed - policy is cached and unchanged
-    return true;
-  }
-
-  // Log what's happening
-  log.info(formatApprovalRequest(approvalRequest));
-
-  // Request approval
-  const approved = await requestPolicyApproval(approvalRequest);
-
-  if (approved) {
-    // Cache the new policy as approved
-    cachePolicyConfig(repository, approvalRequest.newConfig, true);
-  }
-
-  return approved;
 }

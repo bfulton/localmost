@@ -365,7 +365,7 @@ $ localmost status --json
 
 ## Security Considerations
 
-- Camera detection only checks if camera is in use; we don't access camera data
+- Camera detection only checks if camera is in use; we don't access camera data. As built, it runs the `is-camera-on` package's helper with `--watch`, which reads CoreMediaIO's is-running-somewhere property of each camera and prints `true`/`false` on each change; reading it needs no camera permission. The helper ships in the app's Resources, signed with the app and with no entitlements, and is run from there (from the installed package in development)
 - No network calls required for resource monitoring
 - All detection is local and privacy-preserving
 

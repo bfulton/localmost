@@ -6,7 +6,6 @@ import {
   LogEntry,
   LogLevel,
   SleepProtection,
-  ToolCacheLocation,
   UserFilterConfig,
   PowerConfig,
   NotificationsConfig,
@@ -26,6 +25,7 @@ import {
   DEFAULT_POWER_CONFIG,
   DEFAULT_NOTIFICATIONS_CONFIG,
 } from '../../shared/types';
+import { ResourcePauseConfig, DEFAULT_RESOURCE_PAUSE_CONFIG } from '../../shared/job-preferences';
 
 // =============================================================================
 // Theme Types
@@ -53,10 +53,6 @@ export interface ConfigSlice {
   sleepProtection: SleepProtection;
   sleepProtectionConsented: boolean;
 
-  // Runner settings
-  preserveWorkDir: 'never' | 'session' | 'always';
-  toolCacheLocation: ToolCacheLocation;
-
   // User filter
   userFilter: UserFilterConfig;
 
@@ -68,6 +64,9 @@ export interface ConfigSlice {
 
   // Notifications
   notifications: NotificationsConfig;
+
+  // What a resource pause does to running jobs (resourcePause in config.yaml)
+  resourcePause: ResourcePauseConfig;
 
   // App launch settings
   launchAtLogin: boolean;
@@ -188,12 +187,11 @@ export interface ConfigActions {
   setMaxJobHistory: (max: number) => void;
   setSleepProtection: (setting: SleepProtection) => void;
   consentToSleepProtection: () => void;
-  setPreserveWorkDir: (setting: 'never' | 'session' | 'always') => void;
-  setToolCacheLocation: (setting: ToolCacheLocation) => void;
   setUserFilter: (filter: UserFilterConfig) => void;
   setSandboxPolicyLevel: (level: SandboxPolicyLevel) => void;
   setPower: (config: PowerConfig) => void;
   setNotifications: (config: NotificationsConfig) => void;
+  setResourcePause: (config: ResourcePauseConfig) => void;
   setLaunchAtLogin: (enabled: boolean) => void;
   setHideOnStart: (enabled: boolean) => void;
   updateRunnerConfig: (updates: Partial<ConfigSlice['runnerConfig']>) => void;
@@ -276,12 +274,11 @@ export const defaultConfigState: ConfigSlice = {
   maxJobHistory: 10,
   sleepProtection: 'never',
   sleepProtectionConsented: false,
-  preserveWorkDir: 'never',
-  toolCacheLocation: 'persistent',
   userFilter: { scope: 'everyone', allowedUsers: 'just-me', allowlist: [] },
   sandboxPolicyLevel: 'strict',
   power: DEFAULT_POWER_CONFIG,
   notifications: DEFAULT_NOTIFICATIONS_CONFIG,
+  resourcePause: DEFAULT_RESOURCE_PAUSE_CONFIG,
   launchAtLogin: false,
   hideOnStart: false,
   runnerConfig: {

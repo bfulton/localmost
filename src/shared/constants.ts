@@ -98,6 +98,9 @@ export const DEFAULT_MAX_JOB_HISTORY = 10;
 /** Fallback runner version if GitHub API fails */
 export const FALLBACK_RUNNER_VERSION = '2.336.0';
 
+/** The broker's port, BrokerProxyService's default: the one loopback port every job's proxy keeps open. */
+export const DEFAULT_BROKER_PORT = 8787;
+
 // =============================================================================
 // UI Defaults
 // =============================================================================

@@ -1,6 +1,22 @@
-import { describe, it, expect } from '@jest/globals';
-import { parseTestArgs, extractJobOutputs, extractWorkflowOutputs, mergeDiscoveredAccess, DiscoveredAccess } from './test';
-import { LocalmostrcConfig, LOCALMOSTRC_VERSION } from '../shared/localmostrc';
+import { describe, it, expect, jest, beforeEach, afterEach } from '@jest/globals';
+import * as fs from 'fs';
+import * as os from 'os';
+import * as path from 'path';
+import {
+  parseTestArgs,
+  extractJobOutputs,
+  extractWorkflowOutputs,
+  mergeDiscoveredAccess,
+  DiscoveredAccess,
+  handleUpdateRc,
+} from './test';
+import {
+  LocalmostrcConfig,
+  LOCALMOSTRC_VERSION,
+  parseLocalmostrcContent,
+  serializeLocalmostrc,
+} from '../shared/localmostrc';
+import { callInChild } from '../shared/test-utils/call-in-child';
 
 describe('CLI test command', () => {
   describe('parseTestArgs', () => {
@@ -130,6 +146,15 @@ describe('CLI test command', () => {
       });
     });
 
+    it('refuses an option it does not know, rather than run without it', () => {
+      expect(() => parseTestArgs(['--verbsoe'])).toThrow('Unknown option for localmost test: --verbsoe');
+      expect(() => parseTestArgs(['build.yml', '-x'])).toThrow('Unknown option for localmost test: -x');
+    });
+
+    it('says --debug was removed', () => {
+      expect(() => parseTestArgs(['--debug'])).toThrow(/^--debug was removed/);
+    });
+
     it('handles workflow argument anywhere in args', () => {
       const result = parseTestArgs(['--verbose', 'build.yml', '--dry-run']);
       expect(result.workflow).toBe('build.yml');
@@ -192,10 +217,10 @@ describe('output expression resolution', () => {
 
 describe('mergeDiscoveredAccess', () => {
   const discovered = (partial: Partial<DiscoveredAccess>): DiscoveredAccess => ({
-    hosts: [], readPaths: [], writePaths: [], ...partial,
+    hosts: [], ...partial,
   });
 
-  it('adds the hosts and paths an existing policy lacks, and lists only those', () => {
+  it('adds the hosts an existing policy lacks, lists only those, and keeps the rest of it', () => {
     const existing: LocalmostrcConfig = {
       version: 1,
       shared: { network: { allow: ['github.com'] }, filesystem: { read: ['/usr'] } },
@@ -204,19 +229,12 @@ describe('mergeDiscoveredAccess', () => {
 
     const { config, additions } = mergeDiscoveredAccess(existing, discovered({
       hosts: ['github.com', 'registry.npmjs.org'],
-      readPaths: ['/usr', '/opt/homebrew'],
-      writePaths: ['~/Library/Caches/pip'],
     }), 'ci');
 
     expect(config.shared?.network?.allow).toEqual(['github.com', 'registry.npmjs.org']);
-    expect(config.shared?.filesystem?.read).toEqual(['/usr', '/opt/homebrew']);
-    expect(config.shared?.filesystem?.write).toEqual(['~/Library/Caches/pip']);
+    expect(config.shared?.filesystem).toEqual({ read: ['/usr'] });
     expect(config.workflows).toEqual(existing.workflows);
-    expect(additions).toEqual([
-      { label: 'network.allow', items: ['registry.npmjs.org'] },
-      { label: 'filesystem.read', items: ['/opt/homebrew'] },
-      { label: 'filesystem.write', items: ['~/Library/Caches/pip'] },
-    ]);
+    expect(additions).toEqual([{ label: 'network.allow', items: ['registry.npmjs.org'] }]);
   });
 
   it('has nothing to add when the existing policy already covers what was discovered', () => {
@@ -228,19 +246,16 @@ describe('mergeDiscoveredAccess', () => {
   });
 
   it('starts a new policy from the discovered access, with an empty entry for the workflow', () => {
-    const { config, additions } = mergeDiscoveredAccess(undefined, discovered({
-      hosts: ['github.com'],
-      writePaths: ['~/.npm'],
-    }), 'ci');
+    const { config, additions } = mergeDiscoveredAccess(undefined, discovered({ hosts: ['github.com'] }), 'ci');
 
     expect(config).toEqual({
       version: LOCALMOSTRC_VERSION,
-      shared: { network: { allow: ['github.com'] }, filesystem: { write: ['~/.npm'] } },
+      shared: { network: { allow: ['github.com'] } },
       workflows: { ci: {} },
     });
     expect(additions).toEqual([
       { label: 'network.allow', items: ['github.com'] },
-      { label: 'filesystem.write', items: ['~/.npm'] },
+      { label: 'workflows', items: ['"ci"'] },
     ]);
   });
 
@@ -307,7 +322,10 @@ describe('mergeDiscoveredAccess', () => {
 
     expect(config.shared?.docker).toEqual({ build: { context: './' } });
     expect(config.workflows).toEqual({ ci: {} });
-    expect(additions).toEqual([{ label: 'docker.build.context', items: ['./'] }]);
+    expect(additions).toEqual([
+      { label: 'docker.build.context', items: ['./'] },
+      { label: 'workflows', items: ['"ci"'] },
+    ]);
   });
 
   it('ignores a hint that is not a valid docker policy rather than widening the file', () => {
@@ -315,5 +333,192 @@ describe('mergeDiscoveredAccess', () => {
 
     expect(config.shared?.docker).toBeUndefined();
     expect(additions).toEqual([]);
+  });
+
+  it('writes back what the file already declared, deny lists included, and drops what it ignores', () => {
+    // --updaterc rewrites the whole file, not just what it adds: a
+    // hand-written grant or protection it drops or garbles is lost.
+    const existing = parseLocalmostrcContent([
+      'version: 1',
+      'shared:',
+      '  network:',
+      '    allow: ["github.com"]',
+      '    deny: ["tracker.example"]',
+      '    loopback: [5432, 6379]',
+      '  filesystem:',
+      '    deny: ["~/.ssh"]',
+      '  env:',
+      '    deny: ["*_TOKEN"]',
+      'workflows:',
+      '  "Release: tag":',
+      '    secrets:',
+      '      require: [NPM_TOKEN]',
+      '',
+    ].join('\n')).config!;
+
+    const { config } = mergeDiscoveredAccess(existing, discovered({ hosts: ['registry.npmjs.org'] }), 'ci');
+    const reparsed = parseLocalmostrcContent(serializeLocalmostrc(config));
+
+    expect(reparsed.errors).toEqual([]);
+    expect(reparsed.config).toEqual({
+      version: 1,
+      shared: {
+        network: { allow: ['github.com', 'registry.npmjs.org'], deny: ['tracker.example'] },
+        filesystem: { deny: ['~/.ssh'] },
+        env: { deny: ['*_TOKEN'] },
+      },
+      workflows: { 'Release: tag': { secrets: { require: ['NPM_TOKEN'] } } },
+    });
+  });
+});
+
+describe('handleUpdateRc', () => {
+  it('says filesystem access is not recorded in the macOS VM yet', async () => {
+    // The sandbox trace that recorded paths went with the sandbox; a run
+    // that needs a path learns it from the failing step, not from silence.
+    const cwd = fs.mkdtempSync(path.join(os.tmpdir(), 'updaterc-'));
+    const lines: string[] = [];
+    const log = jest.spyOn(console, 'log').mockImplementation((...args: unknown[]) => {
+      lines.push(args.join(' '));
+    });
+    try {
+      await handleUpdateRc(cwd, { name: 'CI' } as never, { hosts: [] }, true);
+    } finally {
+      log.mockRestore();
+      fs.rmSync(cwd, { recursive: true, force: true });
+    }
+    const output = lines.join('\n');
+    expect(output).toMatch(/Filesystem:.*not recorded.*macOS VM/);
+    expect(output).toMatch(/No access to configure/);
+  });
+
+  it('writes a discovered host with the port it was reached on, and no host a policy cannot hold', async () => {
+    // A name the URL parser accepts can still fail the entry grammar - an
+    // empty label, one over 63 characters - and written in, it left a
+    // .localmostrc that no longer parsed.
+    const cwd = fs.mkdtempSync(path.join(os.tmpdir(), 'updaterc-'));
+    const long = `${'x'.repeat(64)}.example`;
+    const lines: string[] = [];
+    const log = jest.spyOn(console, 'log').mockImplementation((...args: unknown[]) => {
+      lines.push(args.join(' '));
+    });
+    let written = '';
+    try {
+      await handleUpdateRc(
+        cwd,
+        { name: 'CI' } as never,
+        { hosts: ['a..b', 'api.example.com:8443', long, 'github.com'] },
+        true
+      );
+      written = fs.readFileSync(path.join(cwd, '.localmostrc'), 'utf-8');
+    } finally {
+      log.mockRestore();
+      fs.rmSync(cwd, { recursive: true, force: true });
+    }
+    const result = parseLocalmostrcContent(written);
+    expect(result.errors).toEqual([]);
+    expect(result.config?.shared?.network?.allow).toEqual(['api.example.com:8443', 'github.com']);
+    const output = lines.join('\n');
+    expect(output).toContain('a..b');
+    expect(output).toContain(long);
+    expect(output).toMatch(/not written/);
+  });
+});
+
+describe('handleUpdateRc and what is at .localmostrc', () => {
+  // The checkout decides what is at that name, and the CLI writing it runs
+  // as the user, outside any sandbox: a link there sent the rewritten policy
+  // - workflow name and all - wherever the repository pointed it.
+  let root: string;
+  let cwd: string;
+  let outside: string;
+  let lines: string[];
+  const found = { hosts: ['github.com'] };
+  const update = () => handleUpdateRc(cwd, { name: '$(touch pwned)' } as never, found, true);
+
+  beforeEach(() => {
+    root = fs.realpathSync(fs.mkdtempSync(path.join(os.tmpdir(), 'updaterc-link-')));
+    cwd = path.join(root, 'repo');
+    outside = path.join(root, 'outside');
+    fs.mkdirSync(cwd);
+    fs.mkdirSync(outside);
+    lines = [];
+    jest.spyOn(console, 'log').mockImplementation((...args: unknown[]) => {
+      lines.push(args.join(' '));
+    });
+  });
+
+  afterEach(() => {
+    jest.restoreAllMocks();
+    fs.rmSync(root, { recursive: true, force: true });
+  });
+
+  it('refuses a dangling link, and creates nothing where it points', async () => {
+    const victim = path.join(outside, '.zshenv');
+    fs.symlinkSync(victim, path.join(cwd, '.localmostrc'));
+
+    await expect(update()).rejects.toThrow(/\.localmostrc is not a regular file/);
+
+    expect(fs.existsSync(victim)).toBe(false);
+    expect(fs.readlinkSync(path.join(cwd, '.localmostrc'))).toBe(victim);
+    expect(fs.readdirSync(cwd)).toEqual(['.localmostrc']);
+  });
+
+  it('refuses a link to a file outside the checkout, and leaves that file alone', async () => {
+    const target = path.join(outside, 'target');
+    fs.writeFileSync(target, 'version: 1\n');
+    fs.symlinkSync(target, path.join(cwd, '.localmostrc'));
+
+    await expect(update()).rejects.toThrow(/not a regular file/);
+
+    expect(fs.readFileSync(target, 'utf-8')).toBe('version: 1\n');
+    expect(fs.readdirSync(cwd)).toEqual(['.localmostrc']);
+  });
+
+  it('refuses a link to /dev/zero without reading it', () => {
+    // Run in a child: reading /dev/zero never ends, and would hang the suite.
+    fs.symlinkSync('/dev/zero', path.join(cwd, '.localmostrc'));
+    const result = callInChild(
+      path.join(__dirname, 'test.ts'),
+      'handleUpdateRc',
+      [cwd, { name: 'CI' }, found, true],
+      { cwd, env: { ...process.env, HOME: root }, timeoutMs: 20_000 }
+    );
+    expect(result.timedOut).toBe(false);
+    expect(result.status).not.toBe(0);
+    expect(result.output).toMatch(/\.localmostrc is not a regular file/);
+  }, 30_000);
+
+  it('names the file it will write, and the workflow entry it adds', async () => {
+    // A workflow's name is chosen by whoever wrote the workflow, and a new
+    // policy gains an entry under it, so that entry is shown with the rest.
+    await update();
+
+    const output = lines.join('\n');
+    expect(output).toContain(`These will be added to ${path.join(cwd, '.localmostrc')}:`);
+    expect(output).toMatch(/workflows\S*\n.*\+.* "\$\(touch pwned\)"/);
+    const written = parseLocalmostrcContent(fs.readFileSync(path.join(cwd, '.localmostrc'), 'utf-8'));
+    expect(Object.keys(written.config?.workflows ?? {})).toEqual(['$(touch pwned)']);
+    expect(fs.existsSync(path.join(cwd, 'pwned'))).toBe(false);
+  });
+
+  it('names the resolved file, not the path it was reached by', async () => {
+    const via = path.join(root, 'via');
+    fs.symlinkSync(cwd, via);
+    fs.writeFileSync(path.join(cwd, '.localmostrc'), 'version: 1\n');
+
+    await handleUpdateRc(via, { name: 'CI' } as never, found, true);
+
+    expect(lines.join('\n')).toContain(`These will be added to ${path.join(cwd, '.localmostrc')}:`);
+    expect(fs.readFileSync(path.join(cwd, '.localmostrc'), 'utf-8')).toMatch(/github\.com/);
+  });
+
+  it('writes .localmostrc, not a .localmostrc.yml the runner would never read', async () => {
+    fs.writeFileSync(path.join(cwd, '.localmostrc.yml'), 'version: 1\n');
+
+    await handleUpdateRc(cwd, { name: 'CI' } as never, found, true);
+
+    expect(fs.readFileSync(path.join(cwd, '.localmostrc'), 'utf-8')).toMatch(/github\.com/);
+    expect(fs.readFileSync(path.join(cwd, '.localmostrc.yml'), 'utf-8')).toBe('version: 1\n');
   });
 });

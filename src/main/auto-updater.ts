@@ -24,7 +24,14 @@ export function initAutoUpdater(mainWindow: BrowserWindow): void {
 
   // Configure update source - uses GitHub Releases
   // Repository is auto-detected from package.json "repository" field
-  autoUpdater.autoDownload = false;
+  // Download as soon as a check finds an update, and install it at the next
+  // quit: the app carries the Docker VM's kernel, runc and dockerd, and their
+  // fixes should not wait for a click. The app checks only at launch and when
+  // asked (index.ts), so a runner left up for weeks still needs a restart or
+  // a click on Check to find one; the design tracks that gap under R12. A
+  // download asked for while one runs joins it (electron-updater keeps one
+  // download promise), so the banner's button stays harmless.
+  autoUpdater.autoDownload = true;
   autoUpdater.autoInstallOnAppQuit = true;
 
   // Redirect electron-updater logs to our logger instead of stdout
@@ -83,7 +90,12 @@ export function initAutoUpdater(mainWindow: BrowserWindow): void {
  * Check for available updates.
  */
 export async function checkForUpdates(): Promise<void> {
-  await autoUpdater.checkForUpdates();
+  const result = await autoUpdater.checkForUpdates();
+  // With autoDownload on, a check that finds an update starts its download
+  // and returns that download's promise. A failed download is reported
+  // through the 'error' event above; observe the promise too, so the failure
+  // is not also logged as an unhandled rejection.
+  result?.downloadPromise?.catch(() => {});
 }
 
 /**

@@ -1,0 +1,139 @@
+{
+  "comment": "Shared bind normalisation vectors (contract §3.7 'Bind matching'). The evaluator (TypeScript) and lm-bindpin (Go) both run them. `destinations`: how a bind destination normalises (path.posix.normalize, then any trailing / removed except for / itself), or `refused` for one that is not absolute. `cases`: `dockerBinds` is a create body's HostConfig.Binds (sources already pinned to real paths), `approved` is what the evaluator reports for it, and `mounts` is the OCI config.json the hook sees for that container; `ok` says whether the hook accepts it, and `share` is the share's mount path.",
+  "destinations": [
+    { "in": "/data", "out": "/data" },
+    { "in": "/data/", "out": "/data" },
+    { "in": "/data//", "out": "/data" },
+    { "in": "//data", "out": "/data" },
+    { "in": "/a//b/", "out": "/a/b" },
+    { "in": "/a/./b", "out": "/a/b" },
+    { "in": "/a/b/../c", "out": "/a/c" },
+    { "in": "/", "out": "/" },
+    { "in": "/..", "out": "/" },
+    { "in": "data", "refused": true },
+    { "in": "./data", "refused": true },
+    { "in": "", "refused": true }
+  ],
+  "cases": [
+    {
+      "name": "an approved read-only bind is matched",
+      "share": "/Users/me/.localmost/runner/sandbox/3-0123456789ab/_work",
+      "dockerBinds": ["/Users/me/.localmost/runner/sandbox/3-0123456789ab/_work/r/r/data:/data:ro"],
+      "approved": [{ "source": "/Users/me/.localmost/runner/sandbox/3-0123456789ab/_work/r/r/data", "destination": "/data", "readOnly": true }],
+      "mounts": [
+        { "destination": "/proc", "type": "proc", "source": "proc", "options": ["nosuid", "noexec", "nodev"] },
+        { "destination": "/data", "type": "bind", "source": "/Users/me/.localmost/runner/sandbox/3-0123456789ab/_work/r/r/data", "options": ["rbind", "ro", "rprivate"] }
+      ],
+      "ok": true
+    },
+    {
+      "name": "a trailing slash and a double slash in the destination normalise",
+      "share": "/S/_work",
+      "dockerBinds": ["/S/_work/a:/data//x/"],
+      "approved": [{ "source": "/S/_work/a", "destination": "/data/x", "readOnly": false }],
+      "mounts": [{ "destination": "/data/x", "type": "bind", "source": "/S/_work/a", "options": ["rbind", "rprivate"] }],
+      "ok": true
+    },
+    {
+      "name": "the share root itself can be bound",
+      "share": "/S/_work",
+      "dockerBinds": ["/S/_work:/w"],
+      "approved": [{ "source": "/S/_work", "destination": "/w", "readOnly": false }],
+      "mounts": [{ "destination": "/w", "type": "bind", "source": "/S/_work", "options": ["rbind", "rw"] }],
+      "ok": true
+    },
+    {
+      "name": "ro approved but the mount is read-write",
+      "share": "/S/_work",
+      "dockerBinds": ["/S/_work/a:/data:ro"],
+      "approved": [{ "source": "/S/_work/a", "destination": "/data", "readOnly": true }],
+      "mounts": [{ "destination": "/data", "type": "bind", "source": "/S/_work/a", "options": ["rbind", "rw"] }],
+      "ok": false
+    },
+    {
+      "name": "docker writes rro for a read-only bind, which counts as read-only",
+      "share": "/S/_work",
+      "dockerBinds": ["/S/_work/a:/data:ro"],
+      "approved": [{ "source": "/S/_work/a", "destination": "/data", "readOnly": true }],
+      "mounts": [{ "destination": "/data", "type": "bind", "source": "/S/_work/a", "options": ["rbind", "rro", "rprivate"] }],
+      "ok": true
+    },
+    {
+      "name": "read-write approved but the mount is read-only",
+      "share": "/S/_work",
+      "dockerBinds": ["/S/_work/a:/data"],
+      "approved": [{ "source": "/S/_work/a", "destination": "/data", "readOnly": false }],
+      "mounts": [{ "destination": "/data", "type": "bind", "source": "/S/_work/a", "options": ["rbind", "ro"] }],
+      "ok": false
+    },
+    {
+      "name": "a share mount with no approval",
+      "share": "/S/_work",
+      "dockerBinds": [],
+      "approved": [],
+      "mounts": [{ "destination": "/data", "type": "bind", "source": "/S/_work/a", "options": ["rbind"] }],
+      "ok": false
+    },
+    {
+      "name": "one approval cannot cover two mounts",
+      "share": "/S/_work",
+      "dockerBinds": ["/S/_work/a:/one"],
+      "approved": [{ "source": "/S/_work/a", "destination": "/one", "readOnly": false }],
+      "mounts": [
+        { "destination": "/one", "type": "bind", "source": "/S/_work/a", "options": ["rbind"] },
+        { "destination": "/one", "type": "bind", "source": "/S/_work/a", "options": ["rbind"] }
+      ],
+      "ok": false
+    },
+    {
+      "name": "the same source approved twice for two destinations",
+      "share": "/S/_work",
+      "dockerBinds": ["/S/_work/a:/one", "/S/_work/a:/two:ro"],
+      "approved": [
+        { "source": "/S/_work/a", "destination": "/one", "readOnly": false },
+        { "source": "/S/_work/a", "destination": "/two", "readOnly": true }
+      ],
+      "mounts": [
+        { "destination": "/two", "type": "bind", "source": "/S/_work/a", "options": ["rbind", "ro"] },
+        { "destination": "/one", "type": "bind", "source": "/S/_work/a", "options": ["rbind"] }
+      ],
+      "ok": true
+    },
+    {
+      "name": "the approved destination does not match the mount's",
+      "share": "/S/_work",
+      "dockerBinds": ["/S/_work/a:/one"],
+      "approved": [{ "source": "/S/_work/a", "destination": "/one", "readOnly": false }],
+      "mounts": [{ "destination": "/elsewhere", "type": "bind", "source": "/S/_work/a", "options": ["rbind"] }],
+      "ok": false
+    },
+    {
+      "name": "the source is compared byte for byte, never cleaned",
+      "share": "/S/_work",
+      "dockerBinds": ["/S/_work/a:/one"],
+      "approved": [{ "source": "/S/_work/a", "destination": "/one", "readOnly": false }],
+      "mounts": [{ "destination": "/one", "type": "bind", "source": "/S/_work/./a", "options": ["rbind"] }],
+      "ok": false
+    },
+    {
+      "name": "a source that reaches the share only after cleaning is still share-backed",
+      "share": "/S/_work",
+      "dockerBinds": [],
+      "approved": [],
+      "mounts": [{ "destination": "/one", "type": "bind", "source": "/tmp/../S/_work/a", "options": ["rbind"] }],
+      "ok": false
+    },
+    {
+      "name": "a mount not on the share is ignored",
+      "share": "/S/_work",
+      "dockerBinds": [],
+      "approved": [],
+      "mounts": [
+        { "destination": "/etc/hosts", "type": "bind", "source": "/var/lib/docker/containers/c/hosts", "options": ["rbind", "rprivate"] },
+        { "destination": "/vol", "type": "bind", "source": "/var/lib/docker/volumes/v/_data", "options": ["rbind"] },
+        { "destination": "/near", "type": "bind", "source": "/S/_work2/a", "options": ["rbind"] }
+      ],
+      "ok": true
+    }
+  ]
+}

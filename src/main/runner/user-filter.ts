@@ -12,6 +12,7 @@
 
 import type { UserFilterConfig, FilterScope, AllowedUsers } from '../../shared/types';
 import { normalizeUserFilterConfig } from '../../shared/user-filter-config';
+import { parseGitHubRepoUrl } from '../../shared/github-names';
 
 /**
  * Normalize a filter config, handling the legacy 'mode' field.
@@ -31,7 +32,8 @@ export function normalizeFilterConfig(
 
 /**
  * Check if a single user is allowed based on filter configuration.
- * Used for 'trigger' scope to check the workflow trigger.
+ * Both filtering scopes check the workflow trigger author with it; 'contributors'
+ * then checks the code's authors with areAllUsersAllowed.
  */
 export function isUserAllowed(
   login: string,
@@ -113,7 +115,8 @@ function isLoginAllowed(
 
 /**
  * Parse a repository string into owner and repo.
- * Handles formats like "owner/repo" and full GitHub URLs.
+ * Handles "owner/repo", as a job reports its repository, and a repository's
+ * URL on github.com.
  */
 export function parseRepository(repository: string): { owner: string; repo: string } | null {
   // Handle "owner/repo" format
@@ -122,13 +125,9 @@ export function parseRepository(repository: string): { owner: string; repo: stri
     return { owner: parts[0], repo: parts[1] };
   }
 
-  // Handle full GitHub URL
-  const match = repository.match(/github\.com[\/:]([^\/]+)\/([^\/\.]+)/);
-  if (match) {
-    return { owner: match[1], repo: match[2] };
-  }
-
-  return null;
+  // The whole string as a repository URL: a repo name keeps its dots, and a
+  // string that only mentions github.com names no repository.
+  return parseGitHubRepoUrl(repository);
 }
 
 /**

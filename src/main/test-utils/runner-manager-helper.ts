@@ -6,17 +6,22 @@
 
 import { RunnerManager } from '../runner-manager';
 import type { RunnerStatus } from '../../shared/types';
-import { ChildProcess } from 'child_process';
+import type { IsolationJob, WorkerHandle } from '../isolation/macos-vm/types';
 
 /**
  * Internal runner instance state (mirrors private type).
  */
 interface RunnerInstance {
-  /** Hash of the approved policy this worker's profile was built from. */
+  /** The stamp of the approved policy this worker was started under. */
   policyStamp?: string;
-  /** The repository whose job this worker claimed, as the broker reported it. */
-  claimedRepository?: string;
-  process: ChildProcess | null;
+  /** This spawn's job as the macOS VM backend knows it. */
+  job?: IsolationJob;
+  sandboxDir?: string;
+  /** The job this worker claimed, as the broker reported it. */
+  claimedJob?: { repository: string; sha: string; workflow: string };
+  /** Set once the worker is finalized and its proxy closed. */
+  policySealed?: boolean;
+  worker: WorkerHandle | null;
   status: RunnerStatus;
   currentJob: {
     name: string;
@@ -31,6 +36,8 @@ interface RunnerInstance {
     githubActor?: string;
     githubSha?: string;
     githubWorkflow?: string;
+    /** The result of the last completion line read, weighed at exit. */
+    runnerResult?: 'completed' | 'failed' | 'cancelled';
   } | null;
   name: string;
   jobsCompleted: number;
@@ -85,7 +92,7 @@ export class RunnerManagerTestHelper {
    */
   setInstance(num: number, instance: Partial<RunnerInstance>): void {
     const full: RunnerInstance = {
-      process: null,
+      worker: null,
       status: 'offline',
       currentJob: null,
       name: `runner-${num}`,
@@ -174,14 +181,79 @@ export class RunnerManagerTestHelper {
     }).applyPolicyForTarget(instanceNum, targetDisplayName, githubSha, '', true);
   }
 
+  /** Start an instance's egress proxy, as spawning does. */
+  async startInstanceProxy(instanceNum: number): Promise<void> {
+    await (this.manager as never as {
+      startInstanceProxy(n: number): Promise<unknown>;
+    }).startInstanceProxy(instanceNum);
+  }
+
+  /** Watch the job events the manager emits, as the app does for notifications. */
+  setOnJobEvent(handler: (event: unknown) => void): void {
+    (this.manager as never as { onJobEvent?: (event: unknown) => void }).onJobEvent = handler;
+  }
+
+  /** Replace startInstance, so a spawn can be made to succeed or fail. */
+  stubStartInstance(impl: (instanceNum: number) => Promise<void>): void {
+    (this.manager as never as { startInstance: unknown }).startInstance = impl;
+  }
+
+  /** Replace the downloader's credential copy, which spawning calls first. */
+  stubCopyProxyCredentials(impl: () => Promise<void>): void {
+    const manager = this.manager as never as { downloader: Record<string, unknown> };
+    manager.downloader = { ...(manager.downloader ?? {}), copyProxyCredentials: impl };
+  }
+
+  /**
+   * Bring the pool up and start the worker for one admitted job, as the app
+   * does: initialize, then admission's hand-off through 'next' to
+   * spawnWorkerForJob. Resolves to whether a worker was started.
+   */
+  async spawnForJob(
+    context: Parameters<RunnerManagerTestHelper['setPendingTargetContext']>[1] = {
+      targetId: 't1',
+      targetDisplayName: 'owner/repo',
+    }
+  ): Promise<boolean> {
+    await this.manager.initialize();
+    this.setPendingTargetContext('next', context);
+    return this.manager.spawnWorkerForJob();
+  }
+
+  /**
+   * Bring the pool up and start a worker in a slot with no job context, as
+   * no production path does any longer.
+   */
+  async startWorkerWithoutJob(instanceNum = 1): Promise<void> {
+    await this.manager.initialize();
+    await this.manager.startInstance(instanceNum);
+  }
+
   /** Seed the target context recorded when an instance is spawned for a job. */
   setPendingTargetContext(
     key: string,
-    context: { targetId: string; targetDisplayName: string; githubSha?: string; githubWorkflow?: string }
+    context: {
+      targetId: string;
+      targetDisplayName: string;
+      actionsUrl?: string;
+      githubRunId?: number;
+      githubJobId?: number;
+      githubSha?: string;
+      githubWorkflow?: string;
+      jobId?: string;
+      githubRepo?: string;
+    }
   ): void {
     (this.manager as never as {
       pendingTargetContext: Map<string, unknown>;
     }).pendingTargetContext.set(key, context);
+  }
+
+  /** The target context currently recorded under a key, if any. */
+  pendingTargetContext(key: string): unknown {
+    return (this.manager as never as {
+      pendingTargetContext: Map<string, unknown>;
+    }).pendingTargetContext.get(key);
   }
 
   /** Register a stub proxy for an instance. */
