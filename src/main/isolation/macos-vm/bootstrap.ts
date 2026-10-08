@@ -72,6 +72,15 @@ export interface BootstrapOptions {
   runnerTarball: string;
   inputs: SetupInputs;
   onStep?: (index: number, of: number, what: string) => void;
+  /** Each wait for Remote Login: the seconds elapsed and what the last probe saw. */
+  onWaiting?: (elapsedSec: number, probe: string) => void;
+  /**
+   * Re-reads the guest's address from the DHCP leases by its MAC. The first
+   * boot can reboot (provisioning, the "Setting up your Mac" phase), and vmnet
+   * may hand the same MAC a different lease, so each probe follows the address
+   * rather than trusting the one the VM leased first.
+   */
+  resolveIp?: () => string | null;
   log: (level: 'info' | 'warn', message: string) => void;
   signal?: AbortSignal;
   ssh?: SshRunner;
@@ -79,6 +88,8 @@ export interface BootstrapOptions {
   reachableTimeoutMs?: number;
   /** Between tries while waiting. */
   retryMs?: number;
+  /** Injected for tests. */
+  now?: () => number;
 }
 
 /** Where the setup's files go in the guest: the administrator's own home. */
@@ -146,6 +157,7 @@ function writeNew(file: string, contents: string, mode: number): void {
  */
 export async function runBootstrap(opts: BootstrapOptions): Promise<void> {
   const ssh = opts.ssh ?? defaultSshRunner;
+  const now = opts.now ?? Date.now;
   const { username, password } = opts.account;
   const passwordFile = path.join(opts.dir, 'password');
   const askpass = path.join(opts.dir, 'askpass');
@@ -154,19 +166,47 @@ export async function runBootstrap(opts: BootstrapOptions): Promise<void> {
   writeNew(passwordFile, `${password}\n`, 0o600);
   writeNew(askpass, `#!/bin/sh\nexec /bin/cat '${passwordFile.replace(/'/g, `'\\''`)}'\n`, 0o700);
   const env = sshEnv(opts.dir);
+  let ip = opts.ip;
   const run = (command: string, input: Buffer | null, onLine: (line: string) => void = () => {}) =>
-    ssh(sshArgs(opts.dir, username, opts.ip, command), env, input, onLine, opts.signal);
+    ssh(sshArgs(opts.dir, username, ip, command), env, input, onLine, opts.signal);
   try {
     // Remote Login answers once the guest is up and, on the guided path,
-    // once the operator has turned it on.
-    const deadline = Date.now() + (opts.reachableTimeoutMs ?? 60 * 60_000);
+    // once the operator has turned it on. The first boot can take many
+    // minutes and can reboot, so each probe re-resolves the address and logs
+    // what it saw with the seconds elapsed: the only window onto a wait that
+    // was otherwise silent for the whole timeout.
+    const start = now();
+    const deadline = start + (opts.reachableTimeoutMs ?? 60 * 60_000);
+    let lastProbe = '';
+    let heartbeat = start;
     for (;;) {
+      const resolved = opts.resolveIp?.();
+      if (resolved && resolved !== ip && isPrivateIPv4(resolved)) {
+        opts.log('info', `the VM's address changed from ${ip} to ${resolved}; following it`);
+        ip = resolved;
+        lastProbe = '';
+      }
       const probe = await run('/usr/bin/true', null);
-      if (probe.code === 0) break;
-      if (Date.now() > deadline) throw new Error(`Remote Login on ${opts.ip} did not answer: ${sanitizeGuestText(probe.stderr, 300)}`);
+      const elapsedSec = Math.round((now() - start) / 1000);
+      if (probe.code === 0) {
+        opts.log('info', `Remote Login answered on ${ip} after ${elapsedSec} s; copying the agent and the runner`);
+        break;
+      }
+      if (now() > deadline) {
+        throw new Error(`Remote Login on ${ip} did not answer within ${Math.round((now() - start) / 60_000)} min: ${sanitizeGuestText(probe.stderr, 300)}`);
+      }
+      const klass = classifyReachStderr(probe.stderr);
+      if (klass !== lastProbe) {
+        opts.log('info', `Remote Login on ${ip}: ${klass} at ${elapsedSec} s`);
+        lastProbe = klass;
+        heartbeat = now();
+      } else if (now() - heartbeat >= 60_000) {
+        opts.log('info', `Remote Login on ${ip}: still ${klass} at ${elapsedSec} s`);
+        heartbeat = now();
+      }
+      opts.onWaiting?.(elapsedSec, klass);
       await sleep(opts.retryMs ?? 10_000, opts.signal);
     }
-    opts.log('info', `Remote Login answered on ${opts.ip}; copying the agent and the runner`);
     const copy = async (local: string, name: string, mode: string) => {
       const result = await run(
         `/bin/mkdir -p -m 700 ${REMOTE_DIR} && /bin/cat > ${REMOTE_DIR}/${name} && /bin/chmod ${mode} ${REMOTE_DIR}/${name}`,
@@ -210,6 +250,22 @@ export async function runBootstrap(opts: BootstrapOptions): Promise<void> {
     fs.rmSync(passwordFile, { force: true });
     fs.rmSync(askpass, { force: true });
   }
+}
+
+/**
+ * A short, stable class for an ssh probe's stderr, so the reachable-wait can
+ * log the guest's boot crossing each threshold: no route (the guest is not on
+ * the network yet) -> TCP refused (it is, but sshd is not listening) -> auth
+ * refused (sshd answers, but the account is not ready) -> answered.
+ */
+export function classifyReachStderr(stderr: string): string {
+  const s = stderr.toLowerCase();
+  if (/no route to host|network is unreachable|host is down/.test(s)) return 'no route (guest not on the network yet)';
+  if (/connection refused/.test(s)) return 'TCP refused (sshd not listening yet)';
+  if (/operation timed out|connection timed out|timed out/.test(s)) return 'timed out (no answer)';
+  if (/connection reset|broken pipe/.test(s)) return 'connection reset';
+  if (/permission denied|authenticat|too many authentication/.test(s)) return 'auth refused (account not ready yet)';
+  return 'not answering';
 }
 
 /** A password from an alphabet with no look-alikes, in groups of four: readable, and typed by hand in the guided setup. */

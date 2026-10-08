@@ -8,7 +8,7 @@ import * as fs from 'fs';
 import * as path from 'path';
 import { frame } from '../../vm/ndjson';
 import { leaseFor, normalizeMac, isPrivateIPv4, parseLeases } from './dhcp-leases';
-import { readablePassword, runBootstrap, sshArgs, sshEnv, SshRunner } from './bootstrap';
+import { classifyReachStderr, readablePassword, runBootstrap, sshArgs, sshEnv, SshRunner } from './bootstrap';
 import { shortTempDir } from '../../test-utils/vm-fixtures';
 
 const LEASES = `{
@@ -151,6 +151,75 @@ describe('the setup over SSH', () => {
     await expect(runBootstrap({ ip: '192.168.64.5', account, dir, agentBinary: agent, runnerTarball: runner, inputs, ssh: fakeSsh().ssh, log: () => {} })).rejects.toThrow(
       /only its owner/
     );
+  });
+
+  it('classifies what a probe saw by its ssh stderr', () => {
+    expect(classifyReachStderr('ssh: connect to host 192.168.64.9 port 22: No route to host')).toMatch(/no route/);
+    expect(classifyReachStderr('ssh: connect to host 192.168.64.9 port 22: Connection refused')).toMatch(/TCP refused/);
+    expect(classifyReachStderr('ssh: connect to host 192.168.64.9 port 22: Operation timed out')).toMatch(/timed out/);
+    expect(classifyReachStderr('localmost-admin@192.168.64.9: Permission denied (keyboard-interactive).')).toMatch(/auth refused/);
+    expect(classifyReachStderr('something else')).toBe('not answering');
+  });
+
+  it('reports each wait with the seconds elapsed and what the probe saw, and logs when it changes', async () => {
+    let clock = 0;
+    const waits: Array<[number, string]> = [];
+    const logs: string[] = [];
+    let tries = 0;
+    const ssh: SshRunner = async (args, _env, _input, onLine) => {
+      const command = args[args.length - 1];
+      if (command === '/usr/bin/true') {
+        tries += 1;
+        if (tries > 3) return { code: 0, stderr: '' };
+        const stderr = tries <= 2 ? 'ssh: connect to host x port 22: No route to host' : 'ssh: connect to host x port 22: Connection refused';
+        return { code: 255, stderr };
+      }
+      if (command.includes(' setup')) for (const l of [frame({ event: 'step', index: 1, of: 1, what: 'x' }), frame({ event: 'done' })]) onLine(l.trimEnd());
+      return { code: 0, stderr: '' };
+    };
+    await runBootstrap({
+      ip: '192.168.64.5', account, dir, agentBinary: agent, runnerTarball: runner, inputs, ssh, retryMs: 1,
+      now: () => (clock += 1000), onWaiting: (s, p) => waits.push([s, p]), log: (_l, m) => logs.push(m),
+    });
+    // Two no-route probes then one refused, so three waits, the class changing once.
+    expect(waits.map((w) => w[1])).toEqual([expect.stringMatching(/no route/), expect.stringMatching(/no route/), expect.stringMatching(/TCP refused/)]);
+    expect(waits.every(([sec]) => sec > 0)).toBe(true);
+    expect(logs.filter((m) => /no route/.test(m))).toHaveLength(1);
+    expect(logs.filter((m) => /TCP refused/.test(m))).toHaveLength(1);
+    expect(logs.some((m) => /answered on 192\.168\.64\.5 after \d+ s/.test(m))).toBe(true);
+  });
+
+  it('follows the guest to a new address when its lease changes', async () => {
+    const seenIps: string[] = [];
+    let n = 0;
+    const ssh: SshRunner = async (args, _env, _input, onLine) => {
+      const command = args[args.length - 1];
+      const ipArg = args[args.length - 2];
+      if (command === '/usr/bin/true') {
+        seenIps.push(ipArg);
+        return ipArg === '192.168.64.9' ? { code: 0, stderr: '' } : { code: 255, stderr: 'No route to host' };
+      }
+      if (command.includes(' setup')) for (const l of [frame({ event: 'step', index: 1, of: 1, what: 'x' }), frame({ event: 'done' })]) onLine(l.trimEnd());
+      return { code: 0, stderr: '' };
+    };
+    const logs: string[] = [];
+    await runBootstrap({
+      ip: '192.168.64.5', account, dir, agentBinary: agent, runnerTarball: runner, inputs, ssh, retryMs: 1,
+      resolveIp: () => (++n >= 3 ? '192.168.64.9' : '192.168.64.5'), log: (_l, m) => logs.push(m),
+    });
+    expect(seenIps).toContain('192.168.64.9');
+    expect(logs.some((m) => /address changed from 192\.168\.64\.5 to 192\.168\.64\.9/.test(m))).toBe(true);
+  });
+
+  it('gives up after the timeout, saying how long it waited', async () => {
+    let clock = 0;
+    const ssh: SshRunner = async () => ({ code: 255, stderr: 'No route to host' });
+    await expect(
+      runBootstrap({
+        ip: '192.168.64.5', account, dir, agentBinary: agent, runnerTarball: runner, inputs, ssh, retryMs: 1,
+        reachableTimeoutMs: 0, now: () => (clock += 60_000), log: () => {},
+      })
+    ).rejects.toThrow(/did not answer within \d+ min/);
   });
 
   it('makes readable passwords the guest accepts', () => {

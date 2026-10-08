@@ -456,14 +456,18 @@ export class MacVmImageManager extends EventEmitter {
         const setupAbort = new AbortController();
         signal.addEventListener('abort', () => setupAbort.abort(), { once: true });
         let setUp = false;
+        const read = d.readLeases ?? (() => readLeases());
         const setup = (d.bootstrap ?? runBootstrap)({
           ip, account, dir: boot, agentBinary: d.agentBinary(), runnerTarball: tarball, signal: setupAbort.signal,
+          resolveIp: () => leaseFor(read(), started.mac!, Math.floor((d.now ?? Date.now)() / 1000)),
           inputs: {
             jobPassword: crypto.randomBytes(24).toString('base64url'),
             discardedAdminPassword: crypto.randomBytes(24).toString('base64url'),
             runnerVersion: arc.version, osVersion: os, osBuild: build,
           },
           onStep: (index, of, what) => this.set({ phase: 'setup', step: `Setting up the VM: ${what}`, percent: Math.floor(((index - 1) / of) * 100), guided: undefined }),
+          onWaiting: (elapsedSec, probe) =>
+            this.set({ phase: 'setup', step: `Waiting for Remote Login in the VM (${probe}), ${Math.floor(elapsedSec / 60)}m elapsed`, percent: undefined, guided: undefined }),
           log: (level, message) => d.log(level, `macOS VM setup: ${message}`),
         }).then(() => {
           setUp = true;
